@@ -403,16 +403,22 @@ def main():
         print(f"[*] Režim simulace / DRY-RUN (Port {active_port} není fyzicky připojen).")
 
     start_time = time.time()
+    last_time = time.time()
+    accum_theta = 0.0
+    direction = -1.0 if str(cfg.get("direction", "ccw")).lower() == "ccw" else 1.0
     ctrl_dt = max(0.15, cfg.get("step_interval_sec", 0.5))
     history_pts = []
     history_w = []
+    last_feed_mult = 1.0
+    planets = compute_planetary_lagrange()
 
     # Pre-populate 4 initial NURBS control points
+    omega0 = (2.0 * math.pi) / cfg.get("period_sec", 20.0)
     for step_i in range(-3, 1):
-        t_sim = step_i * ctrl_dt
+        th_init = step_i * ctrl_dt * omega0 * direction
         g = harvest_grid()
         w_env = harvest_weather()
-        px, py, pr = compute_spiro_point(t_sim, cfg, g, w_env)
+        px, py, pr, _ = compute_spiro_point(th_init, 0.0, cfg, g, w_env, planets)
         pw = 1.0 + abs(g["drift_mhz"]) / 50.0 + (w_env["wind_kmh"] / 80.0)
         history_pts.append((px, py))
         history_w.append(pw)
@@ -438,7 +444,6 @@ def main():
     sync_thread.start()
 
     trail_points = []
-    planets = compute_planetary_lagrange()
     last_trail_save = time.time()
 
     while running:
@@ -448,13 +453,37 @@ def main():
             continue
 
         ctrl_dt = max(0.15, cfg.get("step_interval_sec", 0.5))
-        elapsed = time.time() - start_time
+        now = time.time()
+        dt = now - last_time
+        last_time = now
+        if dt <= 0.0:
+            dt = 0.05
+        elif dt > 1.0:
+            dt = 0.2
+
+        elapsed = now - start_time
         grid = harvest_grid()
         weather = harvest_weather()
         planets = compute_planetary_lagrange()
 
-        # Generate next control point with planetary libration
-        px, py, pr = compute_spiro_point(elapsed + ctrl_dt, cfg, grid, weather, planets)
+        # 50Hz Continental European Grid speed modulation:
+        # Under-frequency (<50.000 Hz) slows down rotation; over-frequency (>50.000 Hz) accelerates it.
+        df = grid["drift_mhz"]
+        speed_mod = max(0.40, min(1.85, 1.0 + (df / 65.0)))
+
+        # Dynamically update hardware stepper feed rate multiplier if shifted by > 0.03
+        if not is_dry and abs(speed_mod - last_feed_mult) > 0.03:
+            send_serial(f"F{speed_mod:.2f}")
+            last_feed_mult = speed_mod
+
+        # Advance continuous phase angle by instantaneous 50Hz-modulated angular velocity
+        omega0 = (2.0 * math.pi) / cfg.get("period_sec", 20.0)
+        d_theta = direction * omega0 * speed_mod * dt
+        accum_theta += d_theta
+        orbit_idx = abs(accum_theta) / (2.0 * math.pi)
+
+        # Generate next control point with Inverse Discrete Fourier Planetary Synthesis
+        px, py, pr, fourier_meta = compute_spiro_point(accum_theta, orbit_idx, cfg, grid, weather, planets)
         pw = 1.0 + abs(grid["drift_mhz"]) / 100.0 + (weather["wind_kmh"] / 200.0)
         history_pts.append((px, py))
         history_w.append(pw)
@@ -485,7 +514,6 @@ def main():
                 trail_points.pop(0)
 
         # Update live status in SHM
-        orbit_idx = elapsed / cfg["period_sec"]
         status = {
             "timestamp": time.time(),
             "elapsed_sec": round(elapsed, 1),
@@ -494,10 +522,13 @@ def main():
             "period_sec": cfg["period_sec"],
             "period_desc": f"{cfg['period_sec']:.1f} s ({int(cfg['period_sec']*50)} grid cycles, {int(2400/cfg['period_sec'])}x Dekan)",
             "direction": str(cfg.get("direction", "ccw")).upper(),
+            "speed_multiplier": round(speed_mod, 3),
+            "speed_desc": f"{speed_mod:.2f}x ({'+' if df >= 0 else ''}{df:.1f} mHz)",
             "pos_mm": {"x": round(last_mx, 2), "y": round(last_my, 2), "r": round(math.hypot(last_mx, last_my), 2)},
             "grid": grid,
             "weather": weather,
             "planets": planets,
+            "fourier_synthesis": fourier_meta,
             "nurbs_interpolation": True,
             "pen_down": True
         }
@@ -515,9 +546,12 @@ def main():
                 "pos_mm": [round(last_mx, 2), round(last_my, 2)],
                 "direction": str(cfg.get("direction", "ccw")).upper(),
                 "period_sec": cfg["period_sec"],
+                "speed_multiplier": round(speed_mod, 3),
+                "speed_desc": f"{speed_mod:.2f}x ({'+' if df >= 0 else ''}{df:.1f} mHz)",
                 "grid": grid,
                 "weather": weather,
                 "planets": planets,
+                "fourier_synthesis": fourier_meta,
                 "trail": trail_points
             }
             try:
@@ -527,22 +561,69 @@ def main():
             except Exception:
                 pass
 
-def compute_spiro_point(t, cfg, grid, weather, planets=None):
+def compute_inverse_fourier_planetary(theta, planets):
+    """
+    Inverse Discrete Fourier Planetary Synthesis:
+    Superimposes harmonic sinusoids with orbital resonance integer modes n in {1, 2, 3, 5, 6, 8},
+    where phase angles are phase-locked to real-time planetary ecliptic longitudes phi_k.
+    Continuous constructive and destructive interference creates an organic, breathing geometric wave.
+    """
+    components = {}
+    r_sum = 0.0
+
+    # 1. Jupiter (♃): Tidal Quadrupole (n=2) + Great Inequality (n=5) resonance with Saturn
+    phi_jup = planets["Jupiter"]["rad"]
+    v_jup2 = 6.2 * math.cos(2.0 * theta - phi_jup)
+    v_jup5 = 2.6 * math.cos(5.0 * theta - phi_jup)
+    v_jup = v_jup2 + v_jup5
+    components["Jupiter"] = {"symbol": "♃", "n": [2, 5], "val_mm": round(v_jup, 2), "phase_deg": round(math.degrees(phi_jup), 1)}
+    r_sum += v_jup
+
+    # 2. Venus (♀): Sacred Pentagram resonance (n=5, 8:13 Earth resonance)
+    phi_ven = planets["Venus"]["rad"]
+    v_ven = 5.4 * math.cos(5.0 * theta - phi_ven)
+    components["Venus"] = {"symbol": "♀", "n": [5], "val_mm": round(v_ven, 2), "phase_deg": round(math.degrees(phi_ven), 1)}
+    r_sum += v_ven
+
+    # 3. Saturn (♄): Dipole eccentricity offset (n=1) + Triangular resonance (n=3)
+    phi_sat = planets["Saturn"]["rad"]
+    v_sat1 = 4.2 * math.cos(theta - phi_sat)
+    v_sat3 = 2.2 * math.cos(3.0 * theta - 2.0 * phi_sat)
+    v_sat = v_sat1 + v_sat3
+    components["Saturn"] = {"symbol": "♄", "n": [1, 3], "val_mm": round(v_sat, 2), "phase_deg": round(math.degrees(phi_sat), 1)}
+    r_sum += v_sat
+
+    # 4. Mars (♂): Triangular harmonic (n=3)
+    phi_mar = planets["Mars"]["rad"]
+    v_mar = 3.4 * math.cos(3.0 * theta - phi_mar)
+    components["Mars"] = {"symbol": "♂", "n": [3], "val_mm": round(v_mar, 2), "phase_deg": round(math.degrees(phi_mar), 1)}
+    r_sum += v_mar
+
+    # 5. Earth-Moon (♁): Hexagonal Lagrange Libration (n=6, L4/L5 Trojan symmetry)
+    phi_ear = planets["Earth"]["rad"]
+    v_ear = 4.2 * math.cos(6.0 * theta - phi_ear)
+    components["Earth"] = {"symbol": "♁", "n": [6], "val_mm": round(v_ear, 2), "phase_deg": round(math.degrees(phi_ear), 1)}
+    r_sum += v_ear
+
+    # 6. Mercury (☿): Octave ripple (n=8, relativistic fast precession)
+    phi_mer = planets["Mercury"]["rad"]
+    v_mer = 2.0 * math.cos(8.0 * theta - phi_mer)
+    components["Mercury"] = {"symbol": "☿", "n": [8], "val_mm": round(v_mer, 2), "phase_deg": round(math.degrees(phi_mer), 1)}
+    r_sum += v_mer
+
+    return r_sum, components
+
+def compute_spiro_point(theta, orbit_num, cfg, grid, weather, planets=None):
     if planets is None:
         planets = compute_planetary_lagrange()
 
-    T0 = float(cfg.get("period_sec", 40.0))
+    T0 = float(cfg.get("period_sec", 20.0))
     R0 = float(cfg.get("r0_mm", 50.0))
     c = float(cfg.get("log_c", 5.0))
-    ampl_grid_max = float(cfg.get("ampl_grid_max", 5.0))
+    ampl_grid_max = float(cfg.get("ampl_grid_max", 3.5))
     temp_factor = float(cfg.get("temp_factor", 0.03))
-    lagrange_ampl = float(cfg.get("lagrange_ampl", 4.5))
     wind_ampl = float(cfg.get("wind_ampl", 0.35))
-
     direction = -1.0 if str(cfg.get("direction", "ccw")).lower() == "ccw" else 1.0
-
-    omega0 = (2.0 * math.pi) / T0
-    theta = direction * omega0 * t
 
     # 1. Base thermal dilatancy (subdued influence)
     R = R0 + temp_factor * (weather["temp_c"] - 10.0)
@@ -552,32 +633,20 @@ def compute_spiro_point(t, cfg, grid, weather, planets=None):
     sgn = 1.0 if df >= 0 else -1.0
     delta_grid = sgn * (math.log(1.0 + abs(df) / c) / math.log(1.0 + 50.0 / c)) * ampl_grid_max
 
-    # 3. Earth-Moon-Sun primary Lagrange Libration lobes (6-fold)
-    r_lagrange = lagrange_ampl + (delta_grid * 0.3)
+    # 3. Inverse Discrete Fourier Planetary Synthesis (Interfering harmonic rosettes)
+    delta_fourier, fourier_meta = compute_inverse_fourier_planetary(theta, planets)
 
-    # 4. Multi-Planetary Lagrange Libration potential (Mercury, Venus, Earth, Mars, Jupiter, Saturn)
-    delta_planets = 0.0
-    grid_coupling = 1.0 + (df / 100.0)
-    for name, p in planets.items():
-        diff = theta - p["rad"]
-        # Trojan equilateral L4/L5 + Collinear L1/L2 + Body attractor
-        trojan = math.cos(3.0 * diff) * 0.55
-        collinear = math.cos(2.0 * diff) * 0.35
-        body = math.cos(diff) * 0.30
-        delta_planets += p["ampl_mm"] * (body + collinear + trojan) * 0.22 * grid_coupling
+    # 4. 36 Decan wind ripple petals (subdued influence)
+    r_wind = 0.10 + (weather["wind_kmh"] / 100.0) * wind_ampl
+    delta_wind = r_wind * math.cos(36.0 * theta)
 
-    # 5. 36 Decan wind ripple petals (subdued influence)
-    r_wind = 0.15 + (weather["wind_kmh"] / 100.0) * wind_ampl
+    # 5. Continuous slow Archimedean spiral pitch
+    spiral_dr = cfg.get("spiral_dr_per_orbit", -0.2) * (orbit_num % 12.0)
 
     # Combined polar radius
-    r_total = R + delta_grid + (r_lagrange * math.cos(6.0 * theta)) + delta_planets + (r_wind * math.cos(36.0 * theta))
+    r_total = R + delta_grid + delta_fourier + delta_wind + spiral_dr
 
-    # 6. Continuous slow Archimedean spiral pitch
-    orbit_num = t / T0
-    spiral_dr = cfg.get("spiral_dr_per_orbit", -0.2) * (orbit_num % 12.0)
-    r_total += spiral_dr
-
-    # Precession angle controlled smoothly by lunar phase & subtle humidity
+    # 6. Precession angle controlled smoothly by lunar phase & subtle humidity
     precess = direction * orbit_num * (2.0 * math.pi / 36.0) * (0.95 + (weather["rh_pct"] / 100.0) * 0.05)
     ang = theta + precess
 
@@ -586,7 +655,7 @@ def compute_spiro_point(t, cfg, grid, weather, planets=None):
     x = r_total * math.sin(ang)
     y = -r_total * math.cos(ang)
 
-    return x, y, r_total
+    return x, y, r_total, fourier_meta
 
 if __name__ == "__main__":
     main()

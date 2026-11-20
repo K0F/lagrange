@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>The Observatoř // Real-Time Planetary Lagrange Spirograph</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Digital Twin of Drkota V-Plotter: Live Continuous Celestial Spirograph driven by 50Hz Grid Frequency, Prague Weather & Multi-Planetary Lagrange Points (Mercury..Saturn).">
+  <meta property="og:title" content="Planetary Lagrange Spirograph // Observatoř Cybernetics">
+  <meta property="og:image" content="https://pešek.com/lagrange/lagrange.png">
+  <style>
+    :root {
+      --bg: #07080b;
+      --card-bg: #0f1118;
+      --border: #222638;
+      --accent: #60a5fa;
+      --grid-locked: #10b981;
+      --grid-drift: #f59e0b;
+      --text: #c0caf5;
+      --dim: #565f89;
+      --mono: "IBM Plex Mono", "Terminus", "Courier New", monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg);
+      color: var(--text);
+      font-family: var(--mono);
+      line-height: 1.5;
+      padding: 1.5rem 1rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+    .container {
+      max-width: 960px;
+      width: 100%;
+    }
+    header {
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    h1 {
+      font-size: 1.35rem;
+      letter-spacing: 0.08em;
+      color: #fff;
+      margin-bottom: 0.4rem;
+    }
+    .meta {
+      font-size: 0.8rem;
+      color: var(--accent);
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .hud-bar {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 0.75rem;
+      margin-bottom: 1.5rem;
+    }
+    .hud-card {
+      background: var(--card-bg);
+      border: 1px solid var(--border);
+      padding: 0.75rem 1rem;
+    }
+    .hud-label {
+      font-size: 0.72rem;
+      color: var(--dim);
+      text-transform: uppercase;
+      margin-bottom: 0.2rem;
+    }
+    .hud-val {
+      font-size: 1.1rem;
+      font-weight: bold;
+      color: #fff;
+    }
+    .hud-val.locked { color: var(--grid-locked); }
+    .hud-val.drift { color: var(--grid-drift); }
+
+    .canvas-wrap {
+      background: #040406;
+      border: 1px solid var(--border);
+      position: relative;
+      width: 100%;
+      aspect-ratio: 1 / 1;
+      max-width: 680px;
+      margin: 0 auto 1.5rem auto;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      box-shadow: 0 12px 40px rgba(0,0,0,0.6);
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+    }
+    .live-badge {
+      position: absolute;
+      top: 12px;
+      left: 14px;
+      font-size: 0.75rem;
+      background: rgba(16, 185, 129, 0.15);
+      border: 1px solid var(--grid-locked);
+      color: var(--grid-locked);
+      padding: 3px 8px;
+      border-radius: 2px;
+      letter-spacing: 0.05em;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .pulse-dot {
+      width: 7px;
+      height: 7px;
+      background: var(--grid-locked);
+      border-radius: 50%;
+      animation: pulse 1.2s infinite;
+    }
+    @keyframes pulse {
+      0% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.4; transform: scale(1.4); }
+      100% { opacity: 1; transform: scale(1); }
+    }
+
+    .planets-bar {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 0.6rem;
+      margin-bottom: 1.5rem;
+    }
+    .planet-card {
+      background: #0b0d14;
+      border: 1px solid #1a1e2d;
+      padding: 0.5rem 0.75rem;
+      font-size: 0.75rem;
+    }
+    .planet-name {
+      font-weight: bold;
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 0.2rem;
+    }
+
+    .spec-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    .spec-box {
+      background: #0b0d14;
+      border: 1px solid var(--border);
+      padding: 1rem;
+      font-size: 0.82rem;
+    }
+    .spec-box h3 {
+      font-size: 0.88rem;
+      color: #fff;
+      margin-bottom: 0.5rem;
+      border-bottom: 1px solid #1f2438;
+      padding-bottom: 0.25rem;
+    }
+    .links-bar {
+      display: flex;
+      gap: 1.2rem;
+      margin-top: 0.75rem;
+      font-size: 0.8rem;
+    }
+    a {
+      color: var(--accent);
+      text-decoration: none;
+      border-bottom: 1px dotted var(--accent);
+    }
+    a:hover {
+      border-bottom: 1px solid #fff;
+      color: #fff;
+    }
+    footer {
+      border-top: 1px solid var(--border);
+      padding-top: 1.2rem;
+      font-size: 0.78rem;
+      color: var(--dim);
+      text-align: center;
+      width: 100%;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div class="meta">Observatoř Cybernetics // Live Digital Twin of Drkota V-Plotter</div>
+      <h1>PLANETARY LAGRANGE LIBRATION SPIROGRAPH</h1>
+      <p style="font-size: 0.82rem; color: #8892b0;">
+        Real-time kinetic telemetry: Multi-Planetary Lagrange Points (Mercury..Saturn), 50Hz Continental European Grid Symlog Breathing, Prague Weather & Rational NURBS Spline Interpolation.
+      </p>
+    </header>
+
+    <div class="hud-bar">
+      <div class="hud-card">
+        <div class="hud-label">50Hz Continental Grid</div>
+        <div class="hud-val" id="hud-freq">50.000 Hz</div>
+        <div style="font-size: 0.75rem; color: var(--dim);" id="hud-drift">Δ 0.0 mHz</div>
+      </div>
+      <div class="hud-card">
+        <div class="hud-label">Drkota Pen (Physical)</div>
+        <div class="hud-val" id="hud-pos">(0.0, 0.0) mm</div>
+        <div style="font-size: 0.75rem; color: var(--dim);" id="hud-orbit">Orbit #0 (0.0%)</div>
+      </div>
+      <div class="hud-card">
+        <div class="hud-label">Prague Weather</div>
+        <div class="hud-val" id="hud-temp">+9.5°C</div>
+        <div style="font-size: 0.75rem; color: var(--dim);" id="hud-weather">Wind 14.8 km/h | 75% RH</div>
+      </div>
+      <div class="hud-card">
+        <div class="hud-label">Harmonic Cadence</div>
+        <div class="hud-val" id="hud-cadence">24.0 s / Orbit</div>
+        <div style="font-size: 0.75rem; color: var(--dim);">100x Decan (1 dm) // NURBS</div>
+      </div>
+    </div>
+
+    <div class="canvas-wrap">
+      <div class="live-badge">
+        <div class="pulse-dot"></div>
+        <span>DRKOTA INK LIVE</span>
+      </div>
+      <canvas id="spiroCanvas" width="900" height="900"></canvas>
+    </div>
+
+    <div class="hud-label" style="margin-bottom: 0.4rem;">Planetary Lagrange Ephemeris (Active Gravitational Poles)</div>
+    <div class="planets-bar" id="planetsBar">
+      <!-- Injected by JavaScript -->
+    </div>
+
+    <div class="spec-grid">
+      <div class="spec-box">
+        <h3>1. PHYSICAL MACHINE TWIN</h3>
+        <p>• <strong>Plotter:</strong> Drkota V-plotter (Arduino Uno + CNC Shield V3) physically mounted on the laboratory wall in Prague.</p>
+        <p>• <strong>Service:</strong> Autonomously driven by <code>drkota-clock.service</code> via serial at 115200 baud.</p>
+        <p>• <strong>Trail:</strong> Canvas renders the exact points touched by the physical pen.</p>
+      </div>
+      <div class="spec-box">
+        <h3>2. MULTI-PLANETARY LAGRANGE LIBRATION</h3>
+        <p>• <strong>Planetary Choir:</strong> Mercury ☿, Venus ♀, Earth ♁, Mars ♂, Jupiter ♃, Saturn ♄.</p>
+        <p>• <strong>Resonant Harmonics:</strong> Each planet introduces its collinear (L1/L2/L3) and Trojan (L4/L5) libration waves weighted by planetary mass ratio μ.</p>
+        <p>• <strong>Jupiter's Swarm:</strong> Dominant 3-body Trojan crest at L4/L5.</p>
+      </div>
+      <div class="spec-box">
+        <h3>3. CONTINENTAL GRID & ATMOSPHERE</h3>
+        <p>• <strong>Symlog 50 Hz:</strong> Logarithmically magnifies sub-20 mHz micro-drift into deep sculptural waves.</p>
+        <p>• <strong>Wind (36 Decans):</strong> Wind speed modulates 36 decanic ripple petals.</p>
+        <p>• <strong>Thermal Dilatancy:</strong> Ambient temperature dictates base dial expansion.</p>
+      </div>
+      <div class="spec-box">
+        <h3>4. MESSAGE TO ESA & WEAK SIGNALS</h3>
+        <p style="font-style: italic; color: #a5b4fc;">"Pozdravuje Kof, Techné a Observatoř."</p>
+        <p>Dedicated to European deep-space missions stationed at Lagrange points (Euclid, Gaia, JWST, Plato, LISA).</p>
+        <div class="links-bar">
+          <a href="lagrange.svg" target="_blank">[ VECTOR SVG ]</a>
+          <a href="lagrange.png" target="_blank">[ HIGH-RES PNG ]</a>
+          <a href="/konzdat/Log_26_W47/" target="_blank">[ KONZDAT W47 ]</a>
+        </div>
+      </div>
+    </div>
+
+    <footer>
+      The Observatoř Cybernetics // Public Domain Copyleft (CC0 1.0 Universal)<br>
+      Kryštof Pešek (Kof) &amp; Techné (τέχνη) // Prague, Czechia
+    </footer>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("spiroCanvas");
+    const ctx = canvas.getContext("2d");
+    const W = canvas.width;
+    const H = canvas.height;
+    const CX = W / 2;
+    const CY = H / 2;
+    const SCALE = 6.2;
+
+    let liveData = null;
+
+    async function fetchLiveTrail() {
+      try {
+        const resp = await fetch('live_trail.json?_t=' + Date.now());
+        if (resp.ok) {
+          liveData = await resp.json();
+          updateHUD();
+          drawCanvas();
+        }
+      } catch (err) {
+        console.warn("Live trail fetch:", err);
+      }
+    }
+
+    function updateHUD() {
+      if (!liveData) return;
+      const g = liveData.grid || { freq_hz: 50.0, drift_mhz: 0.0 };
+      const w = liveData.weather || { temp_c: 9.5, wind_kmh: 14.8, rh_pct: 75 };
+      const pos = liveData.pos_mm || [0, 0];
+
+      const freqEl = document.getElementById("hud-freq");
+      freqEl.textContent = g.freq_hz.toFixed(3) + " Hz";
+      freqEl.className = "hud-val " + (Math.abs(g.drift_mhz) < 30 ? "locked" : "drift");
+
+      const driftText = (g.drift_mhz >= 0 ? "+ " : "- ") + Math.abs(g.drift_mhz).toFixed(1) + " mHz";
+      const speedText = liveData.speed_multiplier ? ` • ${liveData.speed_multiplier.toFixed(2)}x speed` : "";
+      document.getElementById("hud-drift").textContent = driftText + speedText;
+      document.getElementById("hud-pos").textContent = `(${pos[0].toFixed(1)}, ${pos[1].toFixed(1)}) mm`;
+      document.getElementById("hud-orbit").textContent = `Orbit #${liveData.orbit_number || 0} (${(liveData.orbit_progress_pct || 0).toFixed(1)}%)`;
+      document.getElementById("hud-temp").textContent = (w.temp_c >= 0 ? "+" : "") + w.temp_c.toFixed(1) + "°C";
+      document.getElementById("hud-weather").textContent = `Wind ${w.wind_kmh.toFixed(1)} km/h | ${w.rh_pct}% RH`;
+
+      if (liveData.planets) {
+        const bar = document.getElementById("planetsBar");
+        let html = "";
+        const fourier = liveData.fourier_synthesis || {};
+        for (const [name, p] of Object.entries(liveData.planets)) {
+          const f = fourier[name] || null;
+          const fourierStr = f ? `Fourier n=[${f.n.join(",")}] • ΔR: ${f.val_mm >= 0 ? "+" : ""}${f.val_mm.toFixed(1)} mm` : `L4: ${p.l4_deg.toFixed(0)}° | L5: ${p.l5_deg.toFixed(0)}°`;
+          html += `
+            <div class="planet-card" style="border-left: 3px solid ${p.color};">
+              <div class="planet-name" style="color: ${p.color};">
+                <span>${p.symbol} ${name}</span>
+                <span>${p.longitude_deg.toFixed(0)}°</span>
+              </div>
+              <div style="color: var(--dim); font-size: 0.7rem;">${fourierStr}</div>
+            </div>
+          `;
+        }
+        bar.innerHTML = html;
+      }
+    }
+
+    function drawCanvas() {
+      ctx.clearRect(0, 0, W, H);
+
+      ctx.fillStyle = "#040508";
+      ctx.fillRect(0, 0, W, H);
+
+      ctx.strokeStyle = "#1a1e2a";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(16, 16, W - 32, H - 32);
+
+      const R0_px = 50.0 * SCALE;
+      ctx.beginPath();
+      ctx.arc(CX, CY, R0_px, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(40, 160, 90, 0.4)";
+      ctx.lineWidth = 1.2;
+      ctx.setLineDash([4, 4]);
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.arc(CX, CY, 45.0 * SCALE, 0, Math.PI * 2);
+      ctx.arc(CX, CY, 55.0 * SCALE, 0, Math.PI * 2);
+      ctx.strokeStyle = "rgba(60, 70, 95, 0.25)";
+      ctx.lineWidth = 0.8;
+      ctx.setLineDash([2, 5]);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      for (let i = 0; i < 36; i++) {
+        const ang = (i * 10 - 90) * Math.PI / 180;
+        const isCard = (i % 9 === 0);
+        const rIn = (isCard ? 43.0 : 47.5) * SCALE;
+        const rOut = (isCard ? 54.0 : 51.5) * SCALE;
+        ctx.beginPath();
+        ctx.moveTo(CX + rIn * Math.cos(ang), CY + rIn * Math.sin(ang));
+        ctx.lineTo(CX + rOut * Math.cos(ang), CY + rOut * Math.sin(ang));
+        ctx.strokeStyle = isCard ? "rgba(96, 165, 250, 0.45)" : "rgba(45, 55, 75, 0.35)";
+        ctx.lineWidth = isCard ? 1.5 : 0.8;
+        ctx.stroke();
+      }
+
+      if (liveData && liveData.planets) {
+        for (const [name, p] of Object.entries(liveData.planets)) {
+          const planetAng = (p.longitude_deg - 90) * Math.PI / 180;
+          const l4Ang = (p.l4_deg - 90) * Math.PI / 180;
+          const l5Ang = (p.l5_deg - 90) * Math.PI / 180;
+          const rVec = (50.0 + p.ampl_mm * 1.5) * SCALE;
+
+          ctx.beginPath();
+          ctx.moveTo(CX, CY);
+          ctx.lineTo(CX + rVec * Math.cos(l4Ang), CY + rVec * Math.sin(l4Ang));
+          ctx.moveTo(CX, CY);
+          ctx.lineTo(CX + rVec * Math.cos(l5Ang), CY + rVec * Math.sin(l5Ang));
+          ctx.strokeStyle = p.color;
+          ctx.globalAlpha = 0.12;
+          ctx.lineWidth = 1;
+          ctx.setLineDash([3, 4]);
+          ctx.stroke();
+          ctx.setLineDash([]);
+          ctx.globalAlpha = 1.0;
+
+          const px = CX + (51.0 * SCALE) * Math.cos(planetAng);
+          const py = CY + (51.0 * SCALE) * Math.sin(planetAng);
+          ctx.fillStyle = p.color;
+          ctx.font = "12px monospace";
+          ctx.fillText(p.symbol, px - 4, py + 4);
+        }
+      }
+
+      ctx.beginPath();
+      ctx.arc(CX, CY, 4, 0, Math.PI * 2);
+      ctx.fillStyle = "#60a5fa";
+      ctx.fill();
+      ctx.strokeStyle = "#fff";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(CX - 8, CY); ctx.lineTo(CX + 8, CY);
+      ctx.moveTo(CX, CY - 8); ctx.lineTo(CX, CY + 8);
+      ctx.stroke();
+
+      if (liveData && liveData.trail && liveData.trail.length > 1) {
+        const pts = liveData.trail;
+        ctx.beginPath();
+        for (let i = 0; i < pts.length; i++) {
+          const ptX = CX + pts[i][0] * SCALE;
+          const ptY = CY + pts[i][1] * SCALE;
+          if (i === 0) ctx.moveTo(ptX, ptY);
+          else ctx.lineTo(ptX, ptY);
+        }
+        ctx.strokeStyle = "#e2e8f0";
+        ctx.lineWidth = 1.4;
+        ctx.lineJoin = "round";
+        ctx.lineCap = "round";
+        ctx.stroke();
+
+        const cur = liveData.pos_mm || pts[pts.length - 1];
+        const penX = CX + cur[0] * SCALE;
+        const penY = CY + cur[1] * SCALE;
+
+        ctx.beginPath();
+        ctx.arc(penX, penY, 8, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(245, 158, 11, 0.25)";
+        ctx.fill();
+
+        ctx.beginPath();
+        ctx.arc(penX, penY, 3.5, 0, Math.PI * 2);
+        ctx.fillStyle = "#fbbf24";
+        ctx.fill();
+        ctx.strokeStyle = "#fff";
+        ctx.lineWidth = 1;
+        ctx.stroke();
+      }
+    }
+
+    setInterval(fetchLiveTrail, 1100);
+    fetchLiveTrail();
+  </script>
+</body>
+</html>
