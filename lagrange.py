@@ -12,61 +12,238 @@ import time
 import math
 import json
 import argparse
+import shutil
+import subprocess
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone, timedelta
 
 PHI = (1.0 + math.sqrt(5.0)) / 2.0
 
+GRID_SHM_STATUS = "/dev/shm/observator_status.json"
+GRID_SHM_LOCAL = "/dev/shm/grid50.json"
+GRID_NETZFREQUENZ_URL = "https://netzfrequenz.info/json/act.json"
+
+WEATHER_CACHE_PATH = "/dev/shm/drkota_weather.json"
+WEATHER_CACHE_BACKUP = "/tmp/drkota_weather.json"
+OPEN_METEO_URL = (
+    "https://api.open-meteo.com/v1/forecast?"
+    "latitude=50.0875&longitude=14.4214&current="
+    "temperature_2m,relative_humidity_2m,surface_pressure,wind_speed_10m"
+    "&timezone=Europe%2FPrague"
+)
+
+def harvest_grid():
+    """Harvests 50Hz continental European grid telemetry."""
+    if os.path.exists(GRID_SHM_STATUS):
+        try:
+            with open(GRID_SHM_STATUS, "r") as f:
+                d = json.load(f)
+                hz = float(d.get("grid_freq", 50.0))
+                drift = float(d.get("grid_drift_mhz", (hz - 50.0) * 1000.0))
+                return {
+                    "freq_hz": round(hz, 3),
+                    "drift_mhz": round(drift, 1),
+                    "status": "LOCKED" if abs(drift) < 50.0 else "UNSTABLE",
+                    "source": d.get("grid_source", "observator_shm")
+                }
+        except Exception:
+            pass
+
+    if os.path.exists(GRID_SHM_LOCAL):
+        try:
+            with open(GRID_SHM_LOCAL, "r") as f:
+                d = json.load(f)
+                hz = float(d.get("frequency_hz", 50.0))
+                drift = float(d.get("drift_mhz", (hz - 50.0) * 1000.0))
+                return {
+                    "freq_hz": round(hz, 3),
+                    "drift_mhz": round(drift, 1),
+                    "status": d.get("status", "LOCKED"),
+                    "source": "grid50_local"
+                }
+        except Exception:
+            pass
+
+    try:
+        req = urllib.request.Request(GRID_NETZFREQUENZ_URL, headers={"User-Agent": "DrkotaLagrange/1.0"})
+        with urllib.request.urlopen(req, timeout=1.8) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            hz = float(data.get("frequency", 50.0))
+            drift = (hz - 50.0) * 1000.0
+            return {
+                "freq_hz": round(hz, 3),
+                "drift_mhz": round(drift, 1),
+                "status": "LOCKED" if abs(drift) < 50.0 else "UNSTABLE",
+                "source": "netzfrequenz.info (live)"
+            }
+    except Exception:
+        pass
+
+    return {
+        "freq_hz": 50.000,
+        "drift_mhz": 0.0,
+        "status": "NOMINAL",
+        "source": "nominal_fallback"
+    }
+
+def harvest_weather():
+    """Harvests Prague weather telemetry from Open-Meteo with local shm cache fallback."""
+    cached = None
+    cache_file = WEATHER_CACHE_PATH if os.path.exists(os.path.dirname(WEATHER_CACHE_PATH)) else WEATHER_CACHE_BACKUP
+    if os.path.exists(cache_file):
+        try:
+            with open(cache_file, "r") as f:
+                cached = json.load(f)
+        except Exception:
+            cached = None
+
+    try:
+        req = urllib.request.Request(OPEN_METEO_URL, headers={"User-Agent": "DrkotaLagrange/1.0"})
+        with urllib.request.urlopen(req, timeout=2.5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            cur = data.get("current", {})
+            temp = float(cur.get("temperature_2m", 9.5))
+            rh = float(cur.get("relative_humidity_2m", 75))
+            press = float(cur.get("surface_pressure", 975.0))
+            wind = float(cur.get("wind_speed_10m", 15.0))
+            res = {
+                "temp_c": round(temp, 1),
+                "rh_pct": int(rh),
+                "pressure_hpa": round(press, 1),
+                "wind_kmh": round(wind, 1),
+                "source": "Open-Meteo Prague (live)"
+            }
+            try:
+                with open(cache_file, "w") as f:
+                    json.dump(res, f, indent=2)
+            except Exception:
+                pass
+            return res
+    except Exception:
+        pass
+
+    if cached and "temp_c" in cached:
+        cached["source"] = "Open-Meteo (cached fallback)"
+        return cached
+
+    return {
+        "temp_c": 9.0,
+        "rh_pct": 79,
+        "pressure_hpa": 975.2,
+        "wind_kmh": 12.0,
+        "source": "nominal_prague"
+    }
+
+def convert_svg_to_png(svg_path, width_px=1400):
+    """
+    Automatically converts rendered SVG to high-resolution PNG companion.
+    Prioritizes /usr/bin/rsvg-convert (fastest), falls back to inkscape or ImageMagick convert.
+    """
+    if not os.path.exists(svg_path):
+        return None
+    base, _ = os.path.splitext(svg_path)
+    png_path = f"{base}.png"
+    try:
+        if shutil.which("rsvg-convert"):
+            subprocess.run(["rsvg-convert", "-w", str(width_px), svg_path, "-o", png_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return png_path
+        elif shutil.which("inkscape"):
+            subprocess.run(["inkscape", svg_path, f"--export-filename={png_path}", f"--export-width={width_px}"], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return png_path
+        elif shutil.which("convert"):
+            subprocess.run(["convert", "-density", "300", svg_path, png_path], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return png_path
+    except Exception as e:
+        sys.stderr.write(f"[-] SVG->PNG konverze selhala: {e}\n")
+        return None
+    return None
+
 ALPHABET = {
-    'A': [[(0, 50), (20, 0), (40, 50)], [(8, 30), (32, 30)]],
-    'B': [[(0, 0), (0, 50), (28, 50), (36, 40), (28, 25), (0, 25)], [(28, 25), (36, 12), (28, 0), (0, 0)]],
-    'C': [[(40, 10), (30, 0), (10, 0), (0, 12), (0, 38), (10, 50), (30, 50), (40, 40)]],
-    'D': [[(0, 0), (0, 50), (25, 50), (40, 35), (40, 15), (25, 0), (0, 0)]],
-    'E': [[(40, 0), (0, 0), (0, 50), (40, 50)], [(0, 25), (28, 25)]],
-    'F': [[(0, 0), (0, 50), (40, 50)], [(0, 25), (28, 25)]],
-    'G': [[(40, 40), (30, 50), (10, 50), (0, 38), (0, 12), (10, 0), (30, 0), (40, 10), (40, 24), (20, 24)]],
+    'A': [[(0, 50), (20, 0), (40, 50)], [(10, 25), (30, 25)]],
+    'B': [[(0, 50), (0, 0), (30, 0), (40, 12), (30, 25), (0, 25)], [(30, 25), (40, 37), (30, 50), (0, 50)]],
+    'C': [[(40, 0), (0, 0), (0, 50), (40, 50)]],
+    'D': [[(0, 50), (0, 0), (30, 0), (40, 25), (30, 50), (0, 50)]],
+    'E': [[(40, 0), (0, 0), (0, 50), (40, 50)], [(0, 25), (30, 25)]],
+    'F': [[(0, 50), (0, 0), (40, 0)], [(0, 25), (30, 25)]],
+    'G': [[(40, 0), (0, 0), (0, 50), (40, 50), (40, 25), (20, 25)]],
     'H': [[(0, 0), (0, 50)], [(40, 0), (40, 50)], [(0, 25), (40, 25)]],
-    'I': [[(10, 0), (30, 0)], [(20, 0), (20, 50)], [(10, 50), (30, 50)]],
-    'J': [[(5, 12), (15, 0), (30, 0), (40, 10), (40, 50), (20, 50)]],
-    'K': [[(0, 0), (0, 50)], [(40, 50), (0, 22), (40, 0)]],
-    'L': [[(0, 50), (0, 0), (35, 0)]],
-    'M': [[(0, 0), (0, 50), (20, 25), (40, 50), (40, 0)]],
-    'N': [[(0, 0), (0, 50), (40, 0), (40, 50)]],
-    'O': [[(10, 0), (30, 0), (40, 12), (40, 38), (30, 50), (10, 50), (0, 38), (0, 12), (10, 0)]],
-    'P': [[(0, 0), (0, 50), (30, 50), (40, 40), (30, 25), (0, 25)]],
-    'Q': [[(10, 0), (30, 0), (40, 12), (40, 38), (30, 50), (10, 50), (0, 38), (0, 12), (10, 0)], [(25, 12), (42, -5)]],
-    'R': [[(0, 0), (0, 50), (30, 50), (40, 40), (30, 25), (0, 25)], [(18, 25), (40, 0)]],
-    'S': [[(40, 40), (30, 50), (10, 50), (0, 40), (10, 25), (30, 25), (40, 10), (30, 0), (10, 0), (0, 10)]],
-    'T': [[(20, 0), (20, 50)], [(0, 50), (40, 50)]],
-    'U': [[(0, 50), (0, 15), (12, 0), (28, 0), (40, 15), (40, 50)]],
-    'V': [[(0, 50), (20, 0), (40, 50)]],
-    'W': [[(0, 50), (10, 0), (20, 28), (30, 0), (40, 50)]],
-    'X': [[(0, 0), (40, 50)], [(0, 50), (40, 0)]],
-    'Y': [[(20, 0), (20, 25), (0, 50)], [(20, 25), (40, 50)]],
-    'Z': [[(0, 50), (40, 50), (0, 0), (40, 0)]],
-    '0': [[(10, 0), (30, 0), (40, 15), (40, 35), (30, 50), (10, 50), (0, 35), (0, 15), (10, 0)], [(32, 40), (8, 10)]],
-    '1': [[(5, 38), (20, 50), (20, 0)], [(5, 0), (35, 0)]],
-    '2': [[(0, 40), (10, 50), (30, 50), (40, 40), (40, 28), (0, 0), (40, 0)]],
-    '3': [[(5, 42), (12, 50), (32, 50), (40, 40), (30, 25), (40, 10), (30, 0), (10, 0), (0, 8)], [(18, 25), (30, 25)]],
-    '4': [[(30, 0), (30, 50), (0, 15), (42, 15)]],
-    '5': [[(40, 50), (0, 50), (0, 26), (28, 26), (40, 18), (40, 8), (28, 0), (8, 0), (0, 6)]],
-    '6': [[(35, 45), (20, 50), (10, 45), (0, 30), (0, 15), (10, 0), (30, 0), (40, 12), (40, 22), (30, 30), (0, 30)]],
-    '7': [[(0, 50), (40, 50), (18, 0)]],
-    '8': [[(12, 25), (0, 35), (10, 50), (30, 50), (40, 35), (28, 25), (40, 12), (30, 0), (10, 0), (0, 12), (12, 25)]],
-    '9': [[(40, 20), (10, 20), (0, 28), (0, 38), (10, 50), (30, 50), (40, 35), (40, 20), (30, 5), (15, 0), (5, 5)]],
-    ':': [[(18, 14), (22, 14), (22, 18), (18, 18), (18, 14)], [(18, 32), (22, 32), (22, 36), (18, 36), (18, 32)]],
-    '.': [[(18, 0), (22, 0), (22, 4), (18, 4), (18, 0)]],
-    '-': [[(8, 25), (32, 25)]],
-    '+': [[(8, 25), (32, 25)], [(20, 13), (20, 37)]],
-    '/': [[(5, 0), (35, 50)]],
-    '(': [[(28, 50), (18, 38), (18, 12), (28, 0)]],
-    ')': [[(12, 50), (22, 38), (22, 12), (12, 0)]],
-    '[': [[(28, 50), (15, 50), (15, 0), (28, 0)]],
-    ']': [[(12, 50), (25, 50), (25, 0), (12, 0)]],
-    '°': [[(10, 40), (20, 40), (20, 50), (10, 50), (10, 40)]],
-    '=': [[(8, 18), (32, 18)], [(8, 32), (32, 32)]],
-    '☉': [[(10, 10), (30, 10), (30, 30), (10, 30), (10, 10)], [(20, 17), (20, 23)]],
-    '⊕': [[(10, 10), (30, 10), (30, 30), (10, 30), (10, 10)], [(10, 20), (30, 20)], [(20, 10), (20, 30)]],
-    '☽': [[(25, 30), (15, 20), (25, 10)]],
+    'I': [[(20, 0), (20, 50)], [(8, 0), (32, 0)], [(8, 50), (32, 50)]],
+    'J': [[(40, 0), (40, 50), (0, 50), (0, 25)]],
+    'K': [[(0, 0), (0, 50)], [(40, 0), (0, 25), (40, 50)]],
+    'L': [[(0, 0), (0, 50), (40, 50)]],
+    'M': [[(0, 50), (0, 0), (20, 25), (40, 0), (40, 50)]],
+    'N': [[(0, 50), (0, 0), (40, 50), (40, 0)]],
+    'O': [[(0, 0), (40, 0), (40, 50), (0, 50), (0, 0)]],
+    'P': [[(0, 50), (0, 0), (40, 0), (40, 25), (0, 25)]],
+    'Q': [[(0, 0), (40, 0), (40, 50), (0, 50), (0, 0)], [(20, 30), (40, 50)]],
+    'R': [[(0, 50), (0, 0), (40, 0), (40, 25), (0, 25)], [(20, 25), (40, 50)]],
+    'S': [[(40, 0), (0, 0), (0, 25), (40, 25), (40, 50), (0, 50)]],
+    'T': [[(0, 0), (40, 0)], [(20, 0), (20, 50)]],
+    'U': [[(0, 0), (0, 50), (40, 50), (40, 0)]],
+    'V': [[(0, 0), (20, 50), (40, 0)]],
+    'W': [[(0, 0), (10, 50), (20, 25), (30, 50), (40, 0)]],
+    'X': [[(0, 0), (40, 50)], [(40, 0), (0, 50)]],
+    'Y': [[(0, 0), (20, 25), (40, 0)], [(20, 25), (20, 50)]],
+    'Z': [[(0, 0), (40, 0), (0, 50), (40, 50)]],
+    # Czech Accents
+    'Á': [[(0, 50), (20, 0), (40, 50)], [(10, 25), (30, 25)], [(15, -14), (28, -4)]],
+    'Č': [[(40, 0), (0, 0), (0, 50), (40, 50)], [(10, -14), (20, -4), (30, -14)]],
+    'Ď': [[(0, 50), (0, 0), (30, 0), (40, 25), (30, 50), (0, 50)], [(10, -14), (20, -4), (30, -14)]],
+    'É': [[(40, 0), (0, 0), (0, 50), (40, 50)], [(0, 25), (30, 25)], [(15, -14), (28, -4)]],
+    'Ě': [[(40, 0), (0, 0), (0, 50), (40, 50)], [(0, 25), (30, 25)], [(10, -14), (20, -4), (30, -14)]],
+    'Í': [[(20, 0), (20, 50)], [(15, -14), (28, -4)]],
+    'Ň': [[(0, 50), (0, 0), (40, 50), (40, 0)], [(10, -14), (20, -4), (30, -14)]],
+    'Ó': [[(0, 0), (40, 0), (40, 50), (0, 50), (0, 0)], [(15, -14), (28, -4)]],
+    'Ř': [[(0, 50), (0, 0), (40, 0), (40, 25), (0, 25)], [(20, 25), (40, 50)], [(10, -14), (20, -4), (30, -14)]],
+    'Š': [[(40, 0), (0, 0), (0, 25), (40, 25), (40, 50), (0, 50)], [(10, -14), (20, -4), (30, -14)]],
+    'Ť': [[(0, 0), (40, 0)], [(20, 0), (20, 50)], [(10, -14), (20, -4), (30, -14)]],
+    'Ú': [[(0, 0), (0, 50), (40, 50), (40, 0)], [(15, -14), (28, -4)]],
+    'Ů': [[(0, 0), (0, 50), (40, 50), (40, 0)], [(14, -8), (26, -8), (26, -18), (14, -18), (14, -8)]],
+    'Ý': [[(0, 0), (20, 25), (40, 0)], [(20, 25), (20, 50)], [(15, -14), (28, -4)]],
+    'Ž': [[(0, 0), (40, 0), (0, 50), (40, 50)], [(10, -14), (20, -4), (30, -14)]],
+    # Greek / Latin Macron Extensions for Techné
+    'Ē': [[(40, 0), (0, 0), (0, 50), (40, 50)], [(0, 25), (30, 25)], [(10, -10), (30, -10)]],
+    # Numbers
+    '0': [[(0, 0), (40, 0), (40, 50), (0, 50), (0, 0)]],
+    '1': [[(10, 15), (20, 0), (20, 50)], [(5, 50), (35, 50)]],
+    '2': [[(0, 0), (40, 0), (40, 25), (0, 25), (0, 50), (40, 50)]],
+    '3': [[(0, 0), (40, 0), (40, 25), (0, 25)], [(40, 25), (40, 50), (0, 50)]],
+    '4': [[(0, 0), (0, 25), (40, 25)], [(30, 0), (30, 50)]],
+    '5': [[(40, 0), (0, 0), (0, 25), (40, 25), (40, 50), (0, 50)]],
+    '6': [[(40, 0), (0, 0), (0, 50), (40, 50), (40, 25), (0, 25)]],
+    '7': [[(0, 0), (40, 0), (20, 50)]],
+    '8': [[(0, 0), (40, 0), (40, 50), (0, 50), (0, 0)], [(0, 25), (40, 25)]],
+    '9': [[(40, 25), (0, 25), (0, 0), (40, 0), (40, 50), (0, 50)]],
+    # Punctuation & Symbols
+    '-': [[(5, 25), (35, 25)]],
+    '+': [[(20, 10), (20, 40)], [(5, 25), (35, 25)]],
+    '=': [[(5, 18), (35, 18)], [(5, 32), (35, 32)]],
+    '.': [[(18, 45), (22, 45), (22, 50), (18, 50), (18, 45)]],
+    ',': [[(22, 44), (16, 56)]],
+    ':': [[(18, 15), (22, 15)], [(18, 45), (22, 45)]],
+    ';': [[(18, 15), (22, 15)], [(22, 44), (16, 56)]],
+    '/': [[(35, 0), (5, 50)]],
+    '\\': [[(5, 0), (35, 50)]],
+    '(': [[(28, 0), (12, 25), (28, 50)]],
+    ')': [[(12, 0), (28, 25), (12, 50)]],
+    '[': [[(28, 0), (12, 0), (12, 50), (28, 50)]],
+    ']': [[(12, 0), (28, 0), (28, 50), (12, 50)]],
+    '?': [[(0, 12), (0, 0), (40, 0), (40, 22), (20, 32), (20, 38)], [(18, 46), (22, 46)]],
+    '!': [[(20, 0), (20, 35)], [(18, 46), (22, 46)]],
+    '|': [[(20, 0), (20, 50)]],
+    '_': [[(0, 50), (40, 50)]],
+    '~': [[(5, 25), (15, 18), (25, 32), (35, 25)]],
+    '*': [[(10, 15), (30, 35)], [(30, 15), (10, 35)], [(20, 10), (20, 40)]],
+    '#': [[(14, 5), (14, 45)], [(26, 5), (26, 45)], [(5, 18), (35, 18)], [(5, 32), (32, 32)]],
+    '&': [[(35, 50), (10, 25), (25, 0), (10, 0), (0, 25), (25, 50), (35, 35)]],
+    '\'': [[(20, 0), (20, 15)]],
+    '"': [[(15, 0), (15, 15)], [(25, 0), (25, 15)]],
+    '°': [[(26, 2), (36, 2), (36, 14), (26, 14), (26, 2)]],
+    '%': [[(35, 5), (5, 45)], [(10, 8), (18, 8), (18, 16), (10, 16), (10, 8)], [(22, 34), (30, 34), (30, 42), (22, 42), (22, 34)]],
+    'Δ': [[(20, 0), (40, 50), (0, 50), (20, 0)]],
+    '>': [[(10, 10), (30, 25), (10, 40)]],
+    '<': [[(30, 10), (10, 25), (30, 40)]],
 }
 
 def render_text_strokes(text, x, y, char_w=1.6, char_h=2.5, char_gap=0.45, align='left'):
@@ -98,7 +275,7 @@ def render_text_strokes(text, x, y, char_w=1.6, char_h=2.5, char_gap=0.45, align
 
         strokes = ALPHABET.get(lookup_ch, [[(0, 0), (40, 50)], [(0, 50), (40, 0)]])
         for stroke in strokes:
-            pts = [(cursor_x + px * sx, y + (50 - py) * sy) for px, py in stroke]
+            pts = [(cursor_x + px * sx, y + py * sy) for px, py in stroke]
             d = f"M {pts[0][0]:.2f},{pts[0][1]:.2f} " + " ".join(f"L {p[0]:.2f},{p[1]:.2f}" for p in pts[1:])
             paths.append(d)
 
@@ -160,6 +337,9 @@ def compute_celestial_state(target_ts=None):
     phase_pos = (diff_days % synodic_month) / synodic_month
     illumination = 0.5 * (1.0 - math.cos(2.0 * math.pi * phase_pos))
     
+    grid = harvest_grid()
+    weather = harvest_weather()
+    
     return {
         "timestamp": target_ts,
         "cet_str": dt_prague.strftime("%Y-%m-%d %H:%M:%S"),
@@ -173,7 +353,9 @@ def compute_celestial_state(target_ts=None):
             "position": round(phase_pos, 4),
             "illumination_pct": round(illumination * 100.0, 1),
             "lunation_number": lunation
-        }
+        },
+        "grid": grid,
+        "weather": weather
     }
 
 def generate_lagrange_svg(state, width_mm=120.0):
@@ -305,6 +487,23 @@ def generate_lagrange_svg(state, width_mm=120.0):
     paths.append(path_line(mx, my, l2m_x, l2m_y))
     paths.append(path_arc(cx, cy, d_sun, min(l5_rad, l4_rad), max(l5_rad, l4_rad), segments=20))
     
+    # 50 Hz Grid drift meter below dial (Y: 64 to 71 mm)
+    grid_mhz = state["grid"]["drift_mhz"]
+    bar_y = h_mm - 7.2
+    paths.append(path_line(12.0, bar_y, 48.0, bar_y))
+    # Major center tick (0 mHz / 50.000 Hz)
+    paths.append(path_line(30.0, bar_y - 1.5, 30.0, bar_y + 1.5))
+    # Minor ticks (+-20, +-40 mHz)
+    for dm in [-40, -20, 20, 40]:
+        tx_m = 30.0 + (dm / 50.0) * 15.0
+        paths.append(path_line(tx_m, bar_y - 0.8, tx_m, bar_y + 0.8))
+    # Active drift pointer
+    drift_clamped = max(-50.0, min(50.0, grid_mhz))
+    px_m = 30.0 + (drift_clamped / 50.0) * 15.0
+    paths.append(path_line(px_m, bar_y - 2.2, px_m, bar_y + 2.2))
+    paths.append(f"M {px_m-0.8:.2f},{bar_y-2.2:.2f} L {px_m+0.8:.2f},{bar_y-2.2:.2f} L {px_m:.2f},{bar_y-0.8:.2f} Z")
+    paths.extend(render_text_strokes(f"50HZ: {state['grid']['freq_hz']:.3f}HZ (D{state['grid']['drift_mhz']:+.1f}M)", 30.0, bar_y + 2.0, char_w=0.85, char_h=1.2, align="center"))
+    
     # Divider line
     div_x = 59.0
     paths.append(path_line(div_x, 4.5, div_x, h_mm - 4.5))
@@ -312,20 +511,22 @@ def generate_lagrange_svg(state, width_mm=120.0):
     
     # Right Typography Box
     tx = div_x + 3.2
-    y_start = 6.2
-    pitch_y = 5.6
+    y_start = 5.8
+    pitch_y = 5.1
     
     lines = [
-        ("LAGRANGE // 3-BODY CONSTELLATION", 1.8, 2.5),
-        (f"ČAS : {state['cet_str']} CET", 1.5, 2.3),
-        (f"DH36: {state['dh36']['str']} (DEKAN {state['dh36']['decan']:02d})", 1.5, 2.3),
-        (f"AZIM: {state['dh36']['azimuth_deg']:.1f}° SOLAR VECTOR", 1.5, 2.3),
-        (f"LUNA: {state['lunar']['lunation_number']}. LUNACE ({state['lunar']['illumination_pct']}%)", 1.5, 2.3),
-        (f"L2  : ANTI-SOLAR SHADOW (JWST/GAIA)", 1.4, 2.1),
-        (f"L3  : COUNTER-EARTH (3.0E8 KM)", 1.4, 2.1),
-        (f"L4/5: TROJAN TRIAD (+-60° EQUIL)", 1.4, 2.1),
-        (f"L2M : LUNAR FAR-SIDE HALO ANCHOR", 1.4, 2.1),
-        ("--TÉCHNĒ & KOF // DRKOTA V-PLOTTER", 1.3, 1.9),
+        ("LAGRANGE // 3-BODY CONSTELLATION", 1.7, 2.4),
+        (f"ČAS : {state['cet_str']} CET", 1.4, 2.0),
+        (f"DH36: {state['dh36']['str']} (DEKAN {state['dh36']['decan']:02d})", 1.4, 2.0),
+        (f"AZIM: {state['dh36']['azimuth_deg']:.1f}° SOLAR VECTOR", 1.4, 2.0),
+        (f"LUNA: {state['lunar']['lunation_number']}. LUNACE ({state['lunar']['illumination_pct']}%)", 1.4, 2.0),
+        (f"SÍŤ : {state['grid']['freq_hz']:.3f} HZ (Δ {state['grid']['drift_mhz']:+.1f} MHZ)", 1.4, 2.0),
+        (f"METEO: {state['weather']['temp_c']:+.1f}°C | {state['weather']['pressure_hpa']:.1f} HPA | {state['weather']['rh_pct']}% RH", 1.25, 1.8),
+        (f"L2  : ANTI-SOLAR SHADOW (JWST/GAIA)", 1.3, 1.85),
+        (f"L3  : COUNTER-EARTH (3.0E8 KM)", 1.3, 1.85),
+        (f"L4/5: TROJAN TRIAD (+-60° EQUIL)", 1.3, 1.85),
+        (f"L2M : LUNAR FAR-SIDE HALO ANCHOR", 1.3, 1.85),
+        ("--TÉCHNĒ & KOF // DRKOTA V-PLOTTER", 1.2, 1.7),
     ]
     
     for idx, (txt, cw, ch) in enumerate(lines):
@@ -379,6 +580,8 @@ def main():
             print(f"║ Občanský čas   : {state['cet_str']} CET                    ║")
             print(f"║ Metrický čas   : {state['dh36']['str']} (Dekan {state['dh36']['decan']:02d} | Azimut {state['dh36']['azimuth_deg']:.1f}°) ║")
             print(f"║ Lunární fáze   : {state['lunar']['lunation_number']}. lunace | {state['lunar']['illumination_pct']}% osvětlení      ║")
+            print(f"║ 50Hz Síť       : {state['grid']['freq_hz']:.3f} Hz (Δ {state['grid']['drift_mhz']:+.1f} mHz) [{state['grid']['status']}]             ║")
+            print(f"║ Počasí Praha   : {state['weather']['temp_c']:+.1f}°C | {state['weather']['pressure_hpa']:.1f} hPa | {state['weather']['rh_pct']}% RH          ║")
             print("╠══════════════════════════════════════════════════════════════════════════╣")
             print("║ Vzdálenější Lagrangeovy body v konstelaci:                               ║")
             print("║   • L2  (Slunce-Země) : Vnější noční stín (JWST, Gaia, Euclid)          ║")
@@ -392,12 +595,18 @@ def main():
         with open(args.out, "w", encoding="utf-8") as f:
             f.write(svg_data)
         print(f"[+] Lagrange konstelace vygenerována: {args.out} ({w:.1f}x{h:.1f} mm)")
+        png_path = convert_svg_to_png(args.out)
+        if png_path and os.path.exists(png_path):
+            print(f"[+] PNG náhled vygenerován: {png_path} ({os.path.getsize(png_path)} bajtů)")
     elif args.command == "plot":
         svg_data, w, h = generate_lagrange_svg(state, width_mm=args.width)
         out_svg = f"/tmp/lagrange_plot_{int(time.time())}.svg"
         with open(out_svg, "w", encoding="utf-8") as f:
             f.write(svg_data)
         print(f"[+] Připraven tiskový arch pro Drkotu: {out_svg} ({w:.1f}x{h:.1f} mm)")
+        png_path = convert_svg_to_png(out_svg)
+        if png_path and os.path.exists(png_path):
+            print(f"[+] PNG náhled vygenerován: {png_path} ({os.path.getsize(png_path)} bajtů)")
         if args.dry_run:
             print(f"[DRY-RUN] Simulace plotru Drkota: /home/kof/bin/drkota plot {out_svg}")
         else:
