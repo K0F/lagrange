@@ -243,12 +243,12 @@ def sig_handler(signum, frame):
 
 def sync_to_boxc_worker():
     while running:
-        time.sleep(1.6)
+        time.sleep(1.2)
         if os.path.exists(TRAIL_FILE):
             try:
                 subprocess.run(
-                    ["scp", "-q", "-o", "ConnectTimeout=2", TRAIL_FILE, STATUS_FILE, "boxC:/var/www/html/lagrange/"],
-                    timeout=3.5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                    ["scp", "-q", "-o", "ConnectTimeout=2", TRAIL_FILE, "boxC:/var/www/html/lagrange/live_trail.json"],
+                    timeout=2.5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
             except Exception:
                 pass
