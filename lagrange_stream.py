@@ -100,16 +100,17 @@ def harvest_weather():
 
 def load_config():
     default_cfg = {
-        "period_sec": 2400.0,  # 40 min = 1 DH
+        "period_sec": 24.0,    # 100x decan speedup = 24s per orbit (1 metric minute = 1 dm)
         "r0_mm": 50.0,         # 10 cm diameter
-        "step_interval_sec": 1.0,
-        "spiral_dr_per_orbit": -0.8,
+        "step_interval_sec": 0.5, # NURBS control point interval
+        "nurbs_substeps": 6,   # micro-steps along each NURBS segment
+        "spiral_dr_per_orbit": -0.4,
         "log_c": 5.0,
         "ampl_grid_max": 6.0,
         "lagrange_ampl": 5.0,
         "wind_ampl": 3.0,
         "temp_factor": 0.15,
-        "stepper_delay": 300,
+        "stepper_delay": 200,
         "enabled": True,
         "dry_run": False
     }
@@ -149,6 +150,40 @@ def move_to(target_x, target_y):
     send_serial(cmd)
     current_x = target_x
     current_y = target_y
+
+def evaluate_nurbs_segment(p0, p1, p2, p3, w0=1.0, w1=1.0, w2=1.0, w3=1.0, steps=8):
+    """
+    Evaluates a uniform cubic Rational B-Spline (NURBS) segment between control points
+    p1 and p2 using homogeneous coordinates with weights w0..w3.
+    Returns a list of (x, y) coordinates.
+    """
+    pts = []
+    # Homogeneous control points (wx, wy, w)
+    h = [
+        (p0[0] * w0, p0[1] * w0, w0),
+        (p1[0] * w1, p1[1] * w1, w1),
+        (p2[0] * w2, p2[1] * w2, w2),
+        (p3[0] * w3, p3[1] * w3, w3)
+    ]
+    
+    for s in range(1, steps + 1):
+        u = s / float(steps)
+        u2 = u * u
+        u3 = u2 * u
+        b0 = (-u3 + 3.0 * u2 - 3.0 * u + 1.0) / 6.0
+        b1 = (3.0 * u3 - 6.0 * u2 + 4.0) / 6.0
+        b2 = (-3.0 * u3 + 3.0 * u2 + 3.0 * u + 1.0) / 6.0
+        b3 = u3 / 6.0
+
+        hx = b0 * h[0][0] + b1 * h[1][0] + b2 * h[2][0] + b3 * h[3][0]
+        hy = b0 * h[0][1] + b1 * h[1][1] + b2 * h[2][1] + b3 * h[3][1]
+        hw = b0 * h[0][2] + b1 * h[1][2] + b2 * h[2][2] + b3 * h[3][2]
+        
+        if hw != 0.0:
+            pts.append((hx / hw, hy / hw))
+        else:
+            pts.append((hx, hy))
+    return pts
 
 def sig_handler(signum, frame):
     global running
@@ -247,10 +282,27 @@ def main():
         print(f"[*] Režim simulace / DRY-RUN (Port {SERIAL_PORT} není fyzicky připojen).")
 
     start_time = time.time()
-    next_tick = start_time
+    ctrl_dt = max(0.15, cfg.get("step_interval_sec", 0.5))
+    history_pts = []
+    history_w = []
 
-    # Move to initial spirograph start point
-    init_x, init_y, _ = compute_spiro_point(0.0, cfg, {"drift_mhz": 0.0}, {"temp_c": 10.0, "rh_pct": 75.0, "wind_kmh": 15.0})
+    # Pre-populate 4 initial NURBS control points
+    for step_i in range(-3, 1):
+        t_sim = step_i * ctrl_dt
+        g = harvest_grid()
+        w_env = harvest_weather()
+        px, py, pr = compute_spiro_point(t_sim, cfg, g, w_env)
+        pw = 1.0 + abs(g["drift_mhz"]) / 50.0 + (w_env["wind_kmh"] / 80.0)
+        history_pts.append((px, py))
+        history_w.append(pw)
+
+    # Initial start position from NURBS evaluation
+    init_pts = evaluate_nurbs_segment(
+        history_pts[0], history_pts[1], history_pts[2], history_pts[3],
+        history_w[0], history_w[1], history_w[2], history_w[3],
+        steps=2
+    )
+    init_x, init_y = init_pts[0]
     print(f"[*] Pomalý nájezd na startovní pozici ciferníku: ({init_x:.2f}, {init_y:.2f}) mm...")
     move_to(init_x, init_y)
     time.sleep(0.5)
@@ -258,23 +310,45 @@ def main():
         send_serial("P0") # Lower pen to paper
         time.sleep(0.3)
 
-    print(f"[✓] Tisk v reálném čase zahájen. 1 oběh = {cfg['period_sec']:.0f} s ({cfg['period_sec']/60.0:.1f} min).")
+    print(f"[✓] Tisk v reálném čase zahájen (NURBS interpolace). 1 oběh = {cfg['period_sec']:.1f} s ({cfg['period_sec']/60.0:.2f} min).")
 
     while running:
-        loop_start = time.time()
         cfg = load_config()
         if not cfg.get("enabled", True):
             time.sleep(1.0)
             continue
 
+        ctrl_dt = max(0.15, cfg.get("step_interval_sec", 0.5))
         elapsed = time.time() - start_time
         grid = harvest_grid()
         weather = harvest_weather()
 
-        x, y, r = compute_spiro_point(elapsed, cfg, grid, weather)
+        # Generate next control point
+        px, py, pr = compute_spiro_point(elapsed + ctrl_dt, cfg, grid, weather)
+        pw = 1.0 + abs(grid["drift_mhz"]) / 50.0 + (weather["wind_kmh"] / 80.0)
+        history_pts.append((px, py))
+        history_w.append(pw)
+        if len(history_pts) > 4:
+            history_pts.pop(0)
+            history_w.pop(0)
 
-        if not is_dry:
-            move_to(x, y)
+        # Interpolate smooth NURBS curve between history_pts[1] and history_pts[2]
+        nurbs_substeps = max(2, cfg.get("nurbs_substeps", 6))
+        interpolated = evaluate_nurbs_segment(
+            history_pts[0], history_pts[1], history_pts[2], history_pts[3],
+            history_w[0], history_w[1], history_w[2], history_w[3],
+            steps=nurbs_substeps
+        )
+
+        substep_delay = ctrl_dt / float(len(interpolated))
+        last_mx, last_my = current_x, current_y
+        for mx, my in interpolated:
+            if not running:
+                break
+            if not is_dry:
+                move_to(mx, my)
+            last_mx, last_my = mx, my
+            time.sleep(max(0.005, substep_delay * 0.75))
 
         # Update live status in SHM
         orbit_idx = elapsed / cfg["period_sec"]
@@ -284,10 +358,11 @@ def main():
             "orbit_number": int(orbit_idx),
             "orbit_progress_pct": round((orbit_idx - int(orbit_idx)) * 100.0, 1),
             "period_sec": cfg["period_sec"],
-            "period_desc": f"{cfg['period_sec']/60.0:.1f} min (1 DH)",
-            "pos_mm": {"x": round(x, 2), "y": round(y, 2), "r": round(r, 2)},
+            "period_desc": f"{cfg['period_sec']:.1f} s (100x dekan)",
+            "pos_mm": {"x": round(last_mx, 2), "y": round(last_my, 2), "r": round(math.hypot(last_mx, last_my), 2)},
             "grid": grid,
             "weather": weather,
+            "nurbs_interpolation": True,
             "pen_down": True
         }
         try:
@@ -295,15 +370,6 @@ def main():
                 json.dump(status, f, indent=2)
         except Exception:
             pass
-
-        # Precise clockwork pace
-        interval = max(0.2, cfg.get("step_interval_sec", 1.0))
-        next_tick += interval
-        sleep_dur = next_tick - time.time()
-        if sleep_dur > 0:
-            time.sleep(sleep_dur)
-        else:
-            next_tick = time.time()
 
 def compute_spiro_point(t, cfg, grid, weather):
     T0 = float(cfg.get("period_sec", 2400.0))
