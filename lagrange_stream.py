@@ -1,0 +1,300 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+lagrange_stream.py — Real-Time Continuous Three-Body Lagrange & 50Hz Grid Spirograph Plotter
+Observatoř Cybernetics // Kryštof Pešek (Kof) & Techné (τέχνη)
+CC0 1.0 Universal // Public Domain // Anti-Copyright
+
+Drives Drkota (polargraph) continuously in real time:
+- 1 full orbit = 1 DH = 40 minutes (2400 seconds, configurable on the fly)
+- Base circle: diameter 10 cm (R0 = 50.0 mm)
+- 6 Lagrange libration lobes (L1, L2, L3, L4, L5, L2M)
+- 50Hz continental European grid frequency: symlog radial breathing
+- Prague wind speed: 36 decanic ripple petals
+- Temperature: thermal radial dilatancy
+- Relative humidity: Guilloché precession density
+- Continuous non-repeating Spirograph mandala
+"""
+
+import os
+import sys
+import time
+import math
+import json
+import signal
+import urllib.request
+
+# Kinematics constants from gomotor (bazina CNC Shield V3)
+STEPS_PER_MM_LEFT = 190.476190476
+STEPS_PER_MM_RIGHT = 190.476190476
+MOTOR_A_X = -370.0
+MOTOR_B_X = 370.0
+MOTOR_A_Y = 500.0
+MOTOR_B_Y = 500.0
+GONDOLA_WIDTH = 45.0
+HALF_GONDOLA = GONDOLA_WIDTH / 2.0
+
+SERIAL_PORT = os.environ.get("DRKOTA_PORT", "/dev/ttyUSB0")
+BAUD_RATE = int(os.environ.get("DRKOTA_BAUD", 115200))
+
+GRID_SHM_STATUS = "/dev/shm/observator_status.json"
+GRID_SHM_LOCAL = "/dev/shm/grid50.json"
+WEATHER_CACHE = "/dev/shm/drkota_weather.json"
+
+CONFIG_FILE = "/dev/shm/drkota_clock_config.json"
+STATUS_FILE = "/dev/shm/drkota_clock_status.json"
+
+running = True
+serial_conn = None
+current_x = 0.0
+current_y = 0.0
+
+def calc_dist(x1, y1, x2, y2):
+    return math.hypot(x2 - x1, y2 - y1)
+
+CENTER_LEN_A = calc_dist(-HALF_GONDOLA, 0.0, MOTOR_A_X, MOTOR_A_Y)
+CENTER_LEN_B = calc_dist(HALF_GONDOLA, 0.0, MOTOR_B_X, MOTOR_B_Y)
+
+def mm_to_steps(x_mm, y_mm):
+    len_a = calc_dist(x_mm - HALF_GONDOLA, y_mm, MOTOR_A_X, MOTOR_A_Y)
+    len_b = calc_dist(x_mm + HALF_GONDOLA, y_mm, MOTOR_B_X, MOTOR_B_Y)
+    steps_a = int(round((len_a - CENTER_LEN_A) * STEPS_PER_MM_LEFT))
+    steps_b = int(round((len_b - CENTER_LEN_B) * STEPS_PER_MM_RIGHT))
+    return steps_a, steps_b
+
+def harvest_grid():
+    if os.path.exists(GRID_SHM_STATUS):
+        try:
+            with open(GRID_SHM_STATUS, "r") as f:
+                d = json.load(f)
+                hz = float(d.get("grid_freq", 50.0))
+                drift = float(d.get("grid_drift_mhz", (hz - 50.0) * 1000.0))
+                return {"freq_hz": hz, "drift_mhz": drift}
+        except Exception:
+            pass
+    if os.path.exists(GRID_SHM_LOCAL):
+        try:
+            with open(GRID_SHM_LOCAL, "r") as f:
+                d = json.load(f)
+                hz = float(d.get("frequency_hz", 50.0))
+                drift = float(d.get("drift_mhz", (hz - 50.0) * 1000.0))
+                return {"freq_hz": hz, "drift_mhz": drift}
+        except Exception:
+            pass
+    return {"freq_hz": 50.0, "drift_mhz": 0.0}
+
+def harvest_weather():
+    if os.path.exists(WEATHER_CACHE):
+        try:
+            with open(WEATHER_CACHE, "r") as f:
+                d = json.load(f)
+                return {
+                    "temp_c": float(d.get("temp_c", 9.5)),
+                    "rh_pct": float(d.get("rh_pct", 75.0)),
+                    "wind_kmh": float(d.get("wind_kmh", 14.8))
+                }
+        except Exception:
+            pass
+    return {"temp_c": 9.5, "rh_pct": 75.0, "wind_kmh": 14.8}
+
+def load_config():
+    default_cfg = {
+        "period_sec": 2400.0,  # 40 min = 1 DH
+        "r0_mm": 50.0,         # 10 cm diameter
+        "step_interval_sec": 1.0,
+        "spiral_dr_per_orbit": -0.8,
+        "log_c": 5.0,
+        "ampl_grid_max": 6.0,
+        "lagrange_ampl": 5.0,
+        "wind_ampl": 3.0,
+        "temp_factor": 0.15,
+        "stepper_delay": 300,
+        "enabled": True,
+        "dry_run": False
+    }
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r") as f:
+                user_cfg = json.load(f)
+                default_cfg.update(user_cfg)
+        except Exception:
+            pass
+    else:
+        try:
+            with open(CONFIG_FILE, "w") as f:
+                json.dump(default_cfg, f, indent=2)
+        except Exception:
+            pass
+    return default_cfg
+
+def send_serial(cmd):
+    global serial_conn
+    if serial_conn is None:
+        return ""
+    try:
+        payload = (cmd.strip() + "\n").encode("ascii")
+        serial_conn.write(payload)
+        serial_conn.flush()
+        resp = serial_conn.readline().decode("ascii", errors="replace").strip()
+        return resp
+    except Exception as e:
+        sys.stderr.write(f"[-] Serial error: {e}\n")
+        return ""
+
+def move_to(target_x, target_y):
+    global current_x, current_y
+    steps_a, steps_b = mm_to_steps(target_x, target_y)
+    cmd = f"X{steps_a}Y{steps_b}"
+    send_serial(cmd)
+    current_x = target_x
+    current_y = target_y
+
+def sig_handler(signum, frame):
+    global running
+    sys.stderr.write("\n[drkota-clock] Obdržen signál k ukončení. Zvedám pero (P1) a vracím se do počátku (0, 0)...\n")
+    running = False
+    try:
+        send_serial("P1")
+        time.sleep(0.3)
+        move_to(0.0, 0.0)
+        time.sleep(0.5)
+        send_serial("E0")  # disable steppers
+    except Exception:
+        pass
+    try:
+        if os.path.exists(STATUS_FILE):
+            os.remove(STATUS_FILE)
+    except Exception:
+        pass
+    sys.exit(0)
+
+def main():
+    global running, serial_conn, current_x, current_y
+    signal.signal(signal.SIGINT, sig_handler)
+    signal.signal(signal.SIGTERM, sig_handler)
+
+    print("╔════════════════════════════════════════════════════════════════════════╗")
+    print("║ LAGRANGE // REAL-TIME 50HZ & CELESTIAL SPIROGRAPH PLOTTER CLOCK        ║")
+    print("║ Observatoř Cybernetics // Techné & Kof                                ║")
+    print("╚════════════════════════════════════════════════════════════════════════╝")
+
+    cfg = load_config()
+    is_dry = cfg.get("dry_run", False) or not os.path.exists(SERIAL_PORT)
+
+    if not is_dry:
+        import serial
+        print(f"[*] Otevírám {SERIAL_PORT} při {BAUD_RATE} baud...")
+        serial_conn = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=2.0)
+        time.sleep(1.8)
+        send_serial(f"S{cfg['stepper_delay']}")
+        send_serial("E1")
+        send_serial("P1") # Lift pen initially
+        time.sleep(0.5)
+    else:
+        print(f"[*] Režim simulace / DRY-RUN (Port {SERIAL_PORT} není fyzicky připojen).")
+
+    start_time = time.time()
+    next_tick = start_time
+
+    # Move to initial spirograph start point
+    init_x, init_y, _ = compute_spiro_point(0.0, cfg, {"drift_mhz": 0.0}, {"temp_c": 10.0, "rh_pct": 75.0, "wind_kmh": 15.0})
+    print(f"[*] Pomalý nájezd na startovní pozici ciferníku: ({init_x:.2f}, {init_y:.2f}) mm...")
+    move_to(init_x, init_y)
+    time.sleep(0.5)
+    if not is_dry:
+        send_serial("P0") # Lower pen to paper
+        time.sleep(0.3)
+
+    print(f"[✓] Tisk v reálném čase zahájen. 1 oběh = {cfg['period_sec']:.0f} s ({cfg['period_sec']/60.0:.1f} min).")
+
+    while running:
+        loop_start = time.time()
+        cfg = load_config()
+        if not cfg.get("enabled", True):
+            time.sleep(1.0)
+            continue
+
+        elapsed = time.time() - start_time
+        grid = harvest_grid()
+        weather = harvest_weather()
+
+        x, y, r = compute_spiro_point(elapsed, cfg, grid, weather)
+
+        if not is_dry:
+            move_to(x, y)
+
+        # Update live status in SHM
+        orbit_idx = elapsed / cfg["period_sec"]
+        status = {
+            "timestamp": time.time(),
+            "elapsed_sec": round(elapsed, 1),
+            "orbit_number": int(orbit_idx),
+            "orbit_progress_pct": round((orbit_idx - int(orbit_idx)) * 100.0, 1),
+            "period_sec": cfg["period_sec"],
+            "period_desc": f"{cfg['period_sec']/60.0:.1f} min (1 DH)",
+            "pos_mm": {"x": round(x, 2), "y": round(y, 2), "r": round(r, 2)},
+            "grid": grid,
+            "weather": weather,
+            "pen_down": True
+        }
+        try:
+            with open(STATUS_FILE, "w") as f:
+                json.dump(status, f, indent=2)
+        except Exception:
+            pass
+
+        # Precise clockwork pace
+        interval = max(0.2, cfg.get("step_interval_sec", 1.0))
+        next_tick += interval
+        sleep_dur = next_tick - time.time()
+        if sleep_dur > 0:
+            time.sleep(sleep_dur)
+        else:
+            next_tick = time.time()
+
+def compute_spiro_point(t, cfg, grid, weather):
+    T0 = float(cfg.get("period_sec", 2400.0))
+    R0 = float(cfg.get("r0_mm", 50.0))
+    c = float(cfg.get("log_c", 5.0))
+    ampl_grid_max = float(cfg.get("ampl_grid_max", 6.0))
+    temp_factor = float(cfg.get("temp_factor", 0.15))
+    lagrange_ampl = float(cfg.get("lagrange_ampl", 5.0))
+    wind_ampl = float(cfg.get("wind_ampl", 3.0))
+
+    omega0 = (2.0 * math.pi) / T0
+    theta = omega0 * t
+
+    # 1. Base thermal dilatancy
+    R = R0 + temp_factor * (weather["temp_c"] - 10.0)
+
+    # 2. 50Hz Continental Grid Symlog modulation
+    df = grid["drift_mhz"]
+    sgn = 1.0 if df >= 0 else -1.0
+    delta_grid = sgn * (math.log(1.0 + abs(df) / c) / math.log(1.0 + 50.0 / c)) * ampl_grid_max
+
+    # 3. 6 Lagrange Libration lobes (Earth, Sun, Moon, L2, L3, L4, L5, L2M)
+    r_lagrange = lagrange_ampl + (delta_grid * 0.3)
+
+    # 4. 36 Decan wind ripple petals
+    r_wind = 0.8 + (weather["wind_kmh"] / 40.0) * wind_ampl
+
+    # Combined polar radius
+    r_total = R + delta_grid + r_lagrange * math.cos(6.0 * theta) + r_wind * math.cos(36.0 * theta)
+
+    # 5. Continuous slow spiral or Guilloché precession
+    orbit_num = t / T0
+    spiral_dr = cfg.get("spiral_dr_per_orbit", -0.8) * (orbit_num % 12.0)
+    r_total += spiral_dr
+
+    # Precession angle controlled by humidity & lunar phase
+    precess = orbit_num * (2.0 * math.pi / 36.0) * (0.8 + (weather["rh_pct"] / 100.0) * 0.4)
+    ang = theta + precess
+
+    # Cartesian coordinates centered at (0, 0)
+    x = r_total * math.sin(ang)
+    y = -r_total * math.cos(ang)
+
+    return x, y, r_total
+
+if __name__ == "__main__":
+    main()
