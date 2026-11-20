@@ -152,17 +152,18 @@ def harvest_weather():
 
 def load_config():
     default_cfg = {
-        "period_sec": 24.0,    # 100x decan speedup = 24s per orbit (1 metric minute = 1 dm)
+        "period_sec": 6.0,     # 300 cycles of 50Hz (400x Dekan harmonic, 1 orbit = 6.0s)
         "r0_mm": 50.0,         # 10 cm diameter
-        "step_interval_sec": 0.5, # NURBS control point interval
-        "nurbs_substeps": 6,   # micro-steps along each NURBS segment
-        "spiral_dr_per_orbit": -0.4,
+        "step_interval_sec": 0.25, # NURBS control point interval
+        "nurbs_substeps": 4,   # micro-steps along each NURBS segment
+        "spiral_dr_per_orbit": -0.3,
+        "direction": "ccw",    # Counter-Clockwise (CCW)
         "log_c": 5.0,
         "ampl_grid_max": 6.0,
         "lagrange_ampl": 5.0,
         "wind_ampl": 3.0,
         "temp_factor": 0.15,
-        "stepper_delay": 200,
+        "stepper_delay": 120,
         "enabled": True,
         "dry_run": False
     }
@@ -328,7 +329,10 @@ def main():
     parser.add_argument("--fraction", type=str, default=None, help="Fraction of 1 DH (e.g. 1/8 for 5 min, 1/10 for 4 min, 1/1 for 40 min)")
     parser.add_argument("--step", type=float, default=1.0, help="Step interval in seconds (default: 1.0 s)")
     parser.add_argument("--spiral-dr", type=float, default=-0.8, help="Radial shift in mm per orbit (default: -0.8 mm)")
-    parser.add_argument("--speed", type=int, default=300, help="Stepper pulse delay in us (default: 300)")
+    parser.add_argument("--speed", type=int, default=120, help="Stepper pulse delay in us (default: 120)")
+    parser.add_argument("--direction", choices=["cw", "ccw"], default=None, help="Rotation direction (cw or ccw)")
+    parser.add_argument("--ccw", action="store_true", help="Rotate Counter-Clockwise (default)")
+    parser.add_argument("--cw", action="store_true", help="Rotate Clockwise")
     parser.add_argument("--status", action="store_true", help="Print live clock status and exit")
     parser.add_argument("--zero", action="store_true", help="Lift pen and zero plotter to (0, 0)")
     args = parser.parse_args()
@@ -380,6 +384,10 @@ def main():
         cfg["spiral_dr_per_orbit"] = args.spiral_dr
     if args.speed:
         cfg["stepper_delay"] = args.speed
+    if args.cw:
+        cfg["direction"] = "cw"
+    elif args.ccw or args.direction:
+        cfg["direction"] = args.direction or "ccw"
     active_port = find_drkota_port()
     is_dry = cfg.get("dry_run", False) or not (active_port and os.path.exists(active_port))
 
@@ -483,7 +491,8 @@ def main():
             "orbit_number": int(orbit_idx),
             "orbit_progress_pct": round((orbit_idx - int(orbit_idx)) * 100.0, 1),
             "period_sec": cfg["period_sec"],
-            "period_desc": f"{cfg['period_sec']:.1f} s (100x dekan)",
+            "period_desc": f"{cfg['period_sec']:.1f} s ({int(cfg['period_sec']*50)} grid cycles, {int(2400/cfg['period_sec'])}x Dekan)",
+            "direction": str(cfg.get("direction", "ccw")).upper(),
             "pos_mm": {"x": round(last_mx, 2), "y": round(last_my, 2), "r": round(math.hypot(last_mx, last_my), 2)},
             "grid": grid,
             "weather": weather,
@@ -503,6 +512,8 @@ def main():
                 "orbit_number": int(orbit_idx),
                 "orbit_progress_pct": round((orbit_idx - int(orbit_idx)) * 100.0, 1),
                 "pos_mm": [round(last_mx, 2), round(last_my, 2)],
+                "direction": str(cfg.get("direction", "ccw")).upper(),
+                "period_sec": cfg["period_sec"],
                 "grid": grid,
                 "weather": weather,
                 "planets": planets,
@@ -527,8 +538,10 @@ def compute_spiro_point(t, cfg, grid, weather, planets=None):
     lagrange_ampl = float(cfg.get("lagrange_ampl", 5.0))
     wind_ampl = float(cfg.get("wind_ampl", 3.0))
 
+    direction = -1.0 if str(cfg.get("direction", "ccw")).lower() == "ccw" else 1.0
+
     omega0 = (2.0 * math.pi) / T0
-    theta = omega0 * t
+    theta = direction * omega0 * t
 
     # 1. Base thermal dilatancy
     R = R0 + temp_factor * (weather["temp_c"] - 10.0)
@@ -560,14 +573,15 @@ def compute_spiro_point(t, cfg, grid, weather, planets=None):
 
     # 6. Continuous slow Archimedean spiral pitch
     orbit_num = t / T0
-    spiral_dr = cfg.get("spiral_dr_per_orbit", -0.4) * (orbit_num % 12.0)
+    spiral_dr = cfg.get("spiral_dr_per_orbit", -0.3) * (orbit_num % 12.0)
     r_total += spiral_dr
 
     # Precession angle controlled by humidity & lunar phase
-    precess = orbit_num * (2.0 * math.pi / 36.0) * (0.8 + (weather["rh_pct"] / 100.0) * 0.4)
+    precess = direction * orbit_num * (2.0 * math.pi / 36.0) * (0.8 + (weather["rh_pct"] / 100.0) * 0.4)
     ang = theta + precess
 
     # Cartesian coordinates centered at (0, 0)
+    # Under CCW, ang < 0: sin(ang) < 0 -> x < 0 (left/West), -cos(ang) < 0 (top/North -> bottom/South).
     x = r_total * math.sin(ang)
     y = -r_total * math.cos(ang)
 

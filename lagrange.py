@@ -402,8 +402,10 @@ def compute_spiro_point(t, cfg, grid, weather, planets):
     lagrange_ampl = float(cfg.get("lagrange_ampl", 5.0))
     wind_ampl = float(cfg.get("wind_ampl", 3.0))
 
+    direction = -1.0 if str(cfg.get("direction", "ccw")).lower() == "ccw" else 1.0
+
     omega0 = (2.0 * math.pi) / T0
-    theta = omega0 * t
+    theta = direction * omega0 * t
 
     # Thermal base
     R = R0 + temp_factor * (weather["temp_c"] - 10.0)
@@ -438,7 +440,7 @@ def compute_spiro_point(t, cfg, grid, weather, planets):
     r_total += spiral_dr
 
     # Precession from humidity
-    precess = orbit_num * (2.0 * math.pi / 36.0) * (0.8 + (weather["rh_pct"] / 100.0) * 0.4)
+    precess = direction * orbit_num * (2.0 * math.pi / 36.0) * (0.8 + (weather["rh_pct"] / 100.0) * 0.4)
     ang = theta + precess
 
     x = r_total * math.sin(ang)
