@@ -23,6 +23,8 @@ import math
 import json
 import signal
 import argparse
+import threading
+import subprocess
 import urllib.request
 
 # Kinematics constants from gomotor (bazina CNC Shield V3)
@@ -44,6 +46,41 @@ WEATHER_CACHE = "/dev/shm/drkota_weather.json"
 
 CONFIG_FILE = "/dev/shm/drkota_clock_config.json"
 STATUS_FILE = "/dev/shm/drkota_clock_status.json"
+TRAIL_FILE = "/dev/shm/drkota_live_trail.json"
+
+PLANETS = {
+    "Mercury": {"L0": 252.25, "n": 4.0923344, "mu": 1.66e-7, "color": "#9ca3af", "symbol": "☿"},
+    "Venus":   {"L0": 181.98, "n": 1.6021305, "mu": 2.45e-6, "color": "#fbbf24", "symbol": "♀"},
+    "Earth":   {"L0": 100.46, "n": 0.9856474, "mu": 3.00e-6, "color": "#60a5fa", "symbol": "♁"},
+    "Mars":    {"L0": 355.45, "n": 0.5240330, "mu": 3.23e-7, "color": "#f87171", "symbol": "♂"},
+    "Jupiter": {"L0": 34.40,  "n": 0.0830853, "mu": 9.54e-4, "color": "#fb923c", "symbol": "♃"},
+    "Saturn":  {"L0": 49.94,  "n": 0.0334442, "mu": 2.86e-4, "color": "#facc15", "symbol": "♄"}
+}
+
+def compute_planetary_lagrange(target_ts=None):
+    if target_ts is None:
+        target_ts = time.time()
+    d = (target_ts - 946728000.0) / 86400.0
+    bodies = {}
+    for name, p in PLANETS.items():
+        L = (p["L0"] + p["n"] * d) % 360.0
+        rad = math.radians(L)
+        l4_deg = (L + 60.0) % 360.0
+        l5_deg = (L - 60.0) % 360.0
+        l2_deg = (L + 180.0) % 360.0
+        ampl = 3.2 * (math.log(1.0 + p["mu"] / 1e-7) / math.log(1.0 + 9.54e-4 / 1e-7))
+        bodies[name] = {
+            "symbol": p["symbol"],
+            "longitude_deg": round(L, 1),
+            "rad": rad,
+            "l4_deg": round(l4_deg, 1),
+            "l5_deg": round(l5_deg, 1),
+            "l2_deg": round(l2_deg, 1),
+            "ampl_mm": round(ampl, 2),
+            "mu": p["mu"],
+            "color": p["color"]
+        }
+    return bodies
 
 running = True
 serial_conn = None
@@ -204,6 +241,18 @@ def sig_handler(signum, frame):
         pass
     sys.exit(0)
 
+def sync_to_boxc_worker():
+    while running:
+        time.sleep(1.6)
+        if os.path.exists(TRAIL_FILE):
+            try:
+                subprocess.run(
+                    ["scp", "-q", "-o", "ConnectTimeout=2", TRAIL_FILE, STATUS_FILE, "boxC:/var/www/html/lagrange/"],
+                    timeout=3.5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            except Exception:
+                pass
+
 def main():
     global running, serial_conn, current_x, current_y
     signal.signal(signal.SIGINT, sig_handler)
@@ -312,6 +361,14 @@ def main():
 
     print(f"[✓] Tisk v reálném čase zahájen (NURBS interpolace). 1 oběh = {cfg['period_sec']:.1f} s ({cfg['period_sec']/60.0:.2f} min).")
 
+    # Start background synchronization to boxC
+    sync_thread = threading.Thread(target=sync_to_boxc_worker, daemon=True)
+    sync_thread.start()
+
+    trail_points = []
+    planets = compute_planetary_lagrange()
+    last_trail_save = time.time()
+
     while running:
         cfg = load_config()
         if not cfg.get("enabled", True):
@@ -322,9 +379,10 @@ def main():
         elapsed = time.time() - start_time
         grid = harvest_grid()
         weather = harvest_weather()
+        planets = compute_planetary_lagrange()
 
-        # Generate next control point
-        px, py, pr = compute_spiro_point(elapsed + ctrl_dt, cfg, grid, weather)
+        # Generate next control point with planetary libration
+        px, py, pr = compute_spiro_point(elapsed + ctrl_dt, cfg, grid, weather, planets)
         pw = 1.0 + abs(grid["drift_mhz"]) / 50.0 + (weather["wind_kmh"] / 80.0)
         history_pts.append((px, py))
         history_w.append(pw)
@@ -348,6 +406,9 @@ def main():
             if not is_dry:
                 move_to(mx, my)
             last_mx, last_my = mx, my
+            trail_points.append([round(mx, 2), round(my, 2)])
+            if len(trail_points) > 1500:
+                trail_points.pop(0)
             time.sleep(max(0.005, substep_delay * 0.75))
 
         # Update live status in SHM
@@ -362,6 +423,7 @@ def main():
             "pos_mm": {"x": round(last_mx, 2), "y": round(last_my, 2), "r": round(math.hypot(last_mx, last_my), 2)},
             "grid": grid,
             "weather": weather,
+            "planets": planets,
             "nurbs_interpolation": True,
             "pen_down": True
         }
@@ -371,8 +433,29 @@ def main():
         except Exception:
             pass
 
-def compute_spiro_point(t, cfg, grid, weather):
-    T0 = float(cfg.get("period_sec", 2400.0))
+        if time.time() - last_trail_save > 1.2:
+            trail_payload = {
+                "timestamp": time.time(),
+                "orbit_number": int(orbit_idx),
+                "orbit_progress_pct": round((orbit_idx - int(orbit_idx)) * 100.0, 1),
+                "pos_mm": [round(last_mx, 2), round(last_my, 2)],
+                "grid": grid,
+                "weather": weather,
+                "planets": planets,
+                "trail": trail_points
+            }
+            try:
+                with open(TRAIL_FILE, "w") as f:
+                    json.dump(trail_payload, f)
+                last_trail_save = time.time()
+            except Exception:
+                pass
+
+def compute_spiro_point(t, cfg, grid, weather, planets=None):
+    if planets is None:
+        planets = compute_planetary_lagrange()
+
+    T0 = float(cfg.get("period_sec", 24.0))
     R0 = float(cfg.get("r0_mm", 50.0))
     c = float(cfg.get("log_c", 5.0))
     ampl_grid_max = float(cfg.get("ampl_grid_max", 6.0))
@@ -391,18 +474,29 @@ def compute_spiro_point(t, cfg, grid, weather):
     sgn = 1.0 if df >= 0 else -1.0
     delta_grid = sgn * (math.log(1.0 + abs(df) / c) / math.log(1.0 + 50.0 / c)) * ampl_grid_max
 
-    # 3. 6 Lagrange Libration lobes (Earth, Sun, Moon, L2, L3, L4, L5, L2M)
+    # 3. Earth-Moon-Sun primary Lagrange Libration lobes (6-fold)
     r_lagrange = lagrange_ampl + (delta_grid * 0.3)
 
-    # 4. 36 Decan wind ripple petals
+    # 4. Multi-Planetary Lagrange Libration potential (Mercury, Venus, Earth, Mars, Jupiter, Saturn)
+    delta_planets = 0.0
+    grid_coupling = 1.0 + (df / 100.0)
+    for name, p in planets.items():
+        diff = theta - p["rad"]
+        # Trojan equilateral L4/L5 + Collinear L1/L2 + Body attractor
+        trojan = math.cos(3.0 * diff) * 0.55
+        collinear = math.cos(2.0 * diff) * 0.35
+        body = math.cos(diff) * 0.30
+        delta_planets += p["ampl_mm"] * (body + collinear + trojan) * 0.22 * grid_coupling
+
+    # 5. 36 Decan wind ripple petals
     r_wind = 0.8 + (weather["wind_kmh"] / 40.0) * wind_ampl
 
     # Combined polar radius
-    r_total = R + delta_grid + r_lagrange * math.cos(6.0 * theta) + r_wind * math.cos(36.0 * theta)
+    r_total = R + delta_grid + (r_lagrange * math.cos(6.0 * theta)) + delta_planets + (r_wind * math.cos(36.0 * theta))
 
-    # 5. Continuous slow spiral or Guilloché precession
+    # 6. Continuous slow Archimedean spiral pitch
     orbit_num = t / T0
-    spiral_dr = cfg.get("spiral_dr_per_orbit", -0.8) * (orbit_num % 12.0)
+    spiral_dr = cfg.get("spiral_dr_per_orbit", -0.4) * (orbit_num % 12.0)
     r_total += spiral_dr
 
     # Precession angle controlled by humidity & lunar phase
