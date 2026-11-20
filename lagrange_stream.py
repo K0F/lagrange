@@ -152,18 +152,18 @@ def harvest_weather():
 
 def load_config():
     default_cfg = {
-        "period_sec": 6.0,     # 300 cycles of 50Hz (400x Dekan harmonic, 1 orbit = 6.0s)
+        "period_sec": 40.0,    # 2000 cycles of 50Hz (60x Dekan harmonic, 1 orbit = 40.0s)
         "r0_mm": 50.0,         # 10 cm diameter
-        "step_interval_sec": 0.25, # NURBS control point interval
+        "step_interval_sec": 0.4, # NURBS control point interval
         "nurbs_substeps": 4,   # micro-steps along each NURBS segment
-        "spiral_dr_per_orbit": -0.3,
+        "spiral_dr_per_orbit": -0.2,
         "direction": "ccw",    # Counter-Clockwise (CCW)
         "log_c": 5.0,
-        "ampl_grid_max": 6.0,
-        "lagrange_ampl": 5.0,
-        "wind_ampl": 3.0,
-        "temp_factor": 0.15,
-        "stepper_delay": 120,
+        "ampl_grid_max": 5.0,
+        "lagrange_ampl": 4.5,
+        "wind_ampl": 0.35,     # Subdued wind ripple (less significant)
+        "temp_factor": 0.03,   # Subdued thermal drift (less significant)
+        "stepper_delay": 550,  # Continuous laminar stepping delay (~9 mm/s glide)
         "enabled": True,
         "dry_run": False
     }
@@ -455,7 +455,7 @@ def main():
 
         # Generate next control point with planetary libration
         px, py, pr = compute_spiro_point(elapsed + ctrl_dt, cfg, grid, weather, planets)
-        pw = 1.0 + abs(grid["drift_mhz"]) / 50.0 + (weather["wind_kmh"] / 80.0)
+        pw = 1.0 + abs(grid["drift_mhz"]) / 100.0 + (weather["wind_kmh"] / 200.0)
         history_pts.append((px, py))
         history_w.append(pw)
         if len(history_pts) > 4:
@@ -463,7 +463,7 @@ def main():
             history_w.pop(0)
 
         # Interpolate smooth NURBS curve between history_pts[1] and history_pts[2]
-        nurbs_substeps = max(2, cfg.get("nurbs_substeps", 6))
+        nurbs_substeps = max(2, cfg.get("nurbs_substeps", 4))
         interpolated = evaluate_nurbs_segment(
             history_pts[0], history_pts[1], history_pts[2], history_pts[3],
             history_w[0], history_w[1], history_w[2], history_w[3],
@@ -477,11 +477,12 @@ def main():
                 break
             if not is_dry:
                 move_to(mx, my)
+            else:
+                time.sleep(substep_delay)
             last_mx, last_my = mx, my
             trail_points.append([round(mx, 2), round(my, 2)])
             if len(trail_points) > 1500:
                 trail_points.pop(0)
-            time.sleep(max(0.005, substep_delay * 0.75))
 
         # Update live status in SHM
         orbit_idx = elapsed / cfg["period_sec"]
@@ -530,20 +531,20 @@ def compute_spiro_point(t, cfg, grid, weather, planets=None):
     if planets is None:
         planets = compute_planetary_lagrange()
 
-    T0 = float(cfg.get("period_sec", 24.0))
+    T0 = float(cfg.get("period_sec", 40.0))
     R0 = float(cfg.get("r0_mm", 50.0))
     c = float(cfg.get("log_c", 5.0))
-    ampl_grid_max = float(cfg.get("ampl_grid_max", 6.0))
-    temp_factor = float(cfg.get("temp_factor", 0.15))
-    lagrange_ampl = float(cfg.get("lagrange_ampl", 5.0))
-    wind_ampl = float(cfg.get("wind_ampl", 3.0))
+    ampl_grid_max = float(cfg.get("ampl_grid_max", 5.0))
+    temp_factor = float(cfg.get("temp_factor", 0.03))
+    lagrange_ampl = float(cfg.get("lagrange_ampl", 4.5))
+    wind_ampl = float(cfg.get("wind_ampl", 0.35))
 
     direction = -1.0 if str(cfg.get("direction", "ccw")).lower() == "ccw" else 1.0
 
     omega0 = (2.0 * math.pi) / T0
     theta = direction * omega0 * t
 
-    # 1. Base thermal dilatancy
+    # 1. Base thermal dilatancy (subdued influence)
     R = R0 + temp_factor * (weather["temp_c"] - 10.0)
 
     # 2. 50Hz Continental Grid Symlog modulation
@@ -565,19 +566,19 @@ def compute_spiro_point(t, cfg, grid, weather, planets=None):
         body = math.cos(diff) * 0.30
         delta_planets += p["ampl_mm"] * (body + collinear + trojan) * 0.22 * grid_coupling
 
-    # 5. 36 Decan wind ripple petals
-    r_wind = 0.8 + (weather["wind_kmh"] / 40.0) * wind_ampl
+    # 5. 36 Decan wind ripple petals (subdued influence)
+    r_wind = 0.15 + (weather["wind_kmh"] / 100.0) * wind_ampl
 
     # Combined polar radius
     r_total = R + delta_grid + (r_lagrange * math.cos(6.0 * theta)) + delta_planets + (r_wind * math.cos(36.0 * theta))
 
     # 6. Continuous slow Archimedean spiral pitch
     orbit_num = t / T0
-    spiral_dr = cfg.get("spiral_dr_per_orbit", -0.3) * (orbit_num % 12.0)
+    spiral_dr = cfg.get("spiral_dr_per_orbit", -0.2) * (orbit_num % 12.0)
     r_total += spiral_dr
 
-    # Precession angle controlled by humidity & lunar phase
-    precess = direction * orbit_num * (2.0 * math.pi / 36.0) * (0.8 + (weather["rh_pct"] / 100.0) * 0.4)
+    # Precession angle controlled smoothly by lunar phase & subtle humidity
+    precess = direction * orbit_num * (2.0 * math.pi / 36.0) * (0.95 + (weather["rh_pct"] / 100.0) * 0.05)
     ang = theta + precess
 
     # Cartesian coordinates centered at (0, 0)
