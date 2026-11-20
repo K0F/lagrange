@@ -22,6 +22,7 @@ import time
 import math
 import json
 import signal
+import argparse
 import urllib.request
 
 # Kinematics constants from gomotor (bazina CNC Shield V3)
@@ -173,12 +174,64 @@ def main():
     signal.signal(signal.SIGINT, sig_handler)
     signal.signal(signal.SIGTERM, sig_handler)
 
+    parser = argparse.ArgumentParser(description="Lagrange Libration Spirograph Real-Time Plotter Clock")
+    parser.add_argument("--dry-run", action="store_true", help="Run simulation without moving hardware")
+    parser.add_argument("--period", type=float, default=None, help="Orbit duration in seconds (default: 2400.0 = 40 min / 1 DH)")
+    parser.add_argument("--fraction", type=str, default=None, help="Fraction of 1 DH (e.g. 1/8 for 5 min, 1/10 for 4 min, 1/1 for 40 min)")
+    parser.add_argument("--step", type=float, default=1.0, help="Step interval in seconds (default: 1.0 s)")
+    parser.add_argument("--spiral-dr", type=float, default=-0.8, help="Radial shift in mm per orbit (default: -0.8 mm)")
+    parser.add_argument("--speed", type=int, default=300, help="Stepper pulse delay in us (default: 300)")
+    parser.add_argument("--status", action="store_true", help="Print live clock status and exit")
+    parser.add_argument("--zero", action="store_true", help="Lift pen and zero plotter to (0, 0)")
+    args = parser.parse_args()
+
+    if args.status:
+        if os.path.exists(STATUS_FILE):
+            with open(STATUS_FILE, "r") as f:
+                print(f.read())
+        else:
+            print("Status: Plotter clock is not currently active.")
+        return
+
+    if args.zero:
+        if os.path.exists(SERIAL_PORT):
+            import serial
+            s = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=2.0)
+            time.sleep(1.0)
+            s.write(b"P1\nZ0\n")
+            s.flush()
+            time.sleep(0.5)
+            s.close()
+            print("[✓] Plotter lifted (P1) and zeroed (Z0).")
+        return
+
     print("╔════════════════════════════════════════════════════════════════════════╗")
     print("║ LAGRANGE // REAL-TIME 50HZ & CELESTIAL SPIROGRAPH PLOTTER CLOCK        ║")
     print("║ Observatoř Cybernetics // Techné & Kof                                ║")
     print("╚════════════════════════════════════════════════════════════════════════╝")
 
     cfg = load_config()
+    if args.dry_run:
+        cfg["dry_run"] = True
+    if args.period is not None:
+        cfg["period_sec"] = args.period
+    elif args.fraction:
+        fractions = {
+            "1/1": 2400.0,
+            "1/2": 1200.0,
+            "1/4": 600.0,
+            "1/8": 300.0,
+            "1/10": 240.0,
+            "1/12": 200.0,
+            "1/36": 66.666
+        }
+        cfg["period_sec"] = fractions.get(args.fraction, 2400.0)
+    if args.step:
+        cfg["step_interval_sec"] = args.step
+    if args.spiral_dr is not None:
+        cfg["spiral_dr_per_orbit"] = args.spiral_dr
+    if args.speed:
+        cfg["stepper_delay"] = args.speed
     is_dry = cfg.get("dry_run", False) or not os.path.exists(SERIAL_PORT)
 
     if not is_dry:
