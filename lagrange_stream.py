@@ -37,7 +37,22 @@ MOTOR_B_Y = 500.0
 GONDOLA_WIDTH = 45.0
 HALF_GONDOLA = GONDOLA_WIDTH / 2.0
 
-SERIAL_PORT = os.environ.get("DRKOTA_PORT", "/dev/ttyUSB0")
+def find_drkota_port():
+    env_port = os.environ.get("DRKOTA_PORT")
+    if env_port and os.path.exists(env_port):
+        return env_port
+    candidates = [
+        "/dev/drkota",
+        "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0",
+        "/dev/ttyUSB0",
+        "/dev/ttyUSB1",
+    ]
+    for c in candidates:
+        if os.path.exists(c):
+            return c
+    return env_port or "/dev/ttyUSB0"
+
+SERIAL_PORT = find_drkota_port()
 BAUD_RATE = int(os.environ.get("DRKOTA_BAUD", 115200))
 
 GRID_SHM_STATUS = "/dev/shm/observator_status.json"
@@ -166,18 +181,67 @@ def load_config():
             pass
     return default_cfg
 
-def send_serial(cmd):
+serial_err_count = 0
+
+def connect_serial():
     global serial_conn
+    port = find_drkota_port()
+    if not port or not os.path.exists(port):
+        return False
+    try:
+        import serial
+        if serial_conn:
+            try:
+                serial_conn.close()
+            except Exception:
+                pass
+        serial_conn = serial.Serial(port, BAUD_RATE, timeout=2.0)
+        time.sleep(1.8)
+        cfg = load_config()
+        payload = f"S{cfg.get('stepper_delay', 200)}\nE1\n".encode("ascii")
+        serial_conn.write(payload)
+        serial_conn.flush()
+        return True
+    except Exception as e:
+        sys.stderr.write(f"[-] Serial connection failed on {port}: {e}\n")
+        serial_conn = None
+        return False
+
+def send_serial(cmd):
+    global serial_conn, serial_err_count
     if serial_conn is None:
-        return ""
+        if not connect_serial():
+            return ""
     try:
         payload = (cmd.strip() + "\n").encode("ascii")
         serial_conn.write(payload)
         serial_conn.flush()
         resp = serial_conn.readline().decode("ascii", errors="replace").strip()
+        serial_err_count = 0
         return resp
     except Exception as e:
-        sys.stderr.write(f"[-] Serial error: {e}\n")
+        serial_err_count += 1
+        sys.stderr.write(f"[-] Serial error ({serial_err_count}): {e}\n")
+        try:
+            if serial_conn:
+                serial_conn.close()
+        except Exception:
+            pass
+        serial_conn = None
+        # Attempt immediate reconnect
+        if connect_serial():
+            try:
+                payload = (cmd.strip() + "\n").encode("ascii")
+                serial_conn.write(payload)
+                serial_conn.flush()
+                resp = serial_conn.readline().decode("ascii", errors="replace").strip()
+                serial_err_count = 0
+                return resp
+            except Exception:
+                pass
+        if serial_err_count >= 5:
+            sys.stderr.write("[-] Příliš mnoho sériových chyb za sebou. Ukončuji pro čistý restart systemd...\n")
+            sys.exit(1)
         return ""
 
 def move_to(target_x, target_y):
@@ -316,19 +380,19 @@ def main():
         cfg["spiral_dr_per_orbit"] = args.spiral_dr
     if args.speed:
         cfg["stepper_delay"] = args.speed
-    is_dry = cfg.get("dry_run", False) or not os.path.exists(SERIAL_PORT)
+    active_port = find_drkota_port()
+    is_dry = cfg.get("dry_run", False) or not (active_port and os.path.exists(active_port))
 
     if not is_dry:
-        import serial
-        print(f"[*] Otevírám {SERIAL_PORT} při {BAUD_RATE} baud...")
-        serial_conn = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=2.0)
-        time.sleep(1.8)
-        send_serial(f"S{cfg['stepper_delay']}")
-        send_serial("E1")
-        send_serial("P1") # Lift pen initially
-        time.sleep(0.5)
+        print(f"[*] Otevírám {active_port} při {BAUD_RATE} baud...")
+        if not connect_serial():
+            is_dry = True
+            print(f"[-] Nepodařilo se připojit k {active_port}, přepínám do režimu DRY-RUN.")
+        else:
+            send_serial("P1") # Lift pen initially
+            time.sleep(0.5)
     else:
-        print(f"[*] Režim simulace / DRY-RUN (Port {SERIAL_PORT} není fyzicky připojen).")
+        print(f"[*] Režim simulace / DRY-RUN (Port {active_port} není fyzicky připojen).")
 
     start_time = time.time()
     ctrl_dt = max(0.15, cfg.get("step_interval_sec", 0.5))
