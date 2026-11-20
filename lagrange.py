@@ -509,24 +509,19 @@ def generate_lagrange_svg(state, width_mm=120.0):
     paths.append(path_line(div_x, 4.5, div_x, h_mm - 4.5))
     paths.append(path_line(div_x + 0.8, 6.0, div_x + 0.8, h_mm - 6.0))
     
-    # Right Typography Box
+    # Right Typography & Telemetry Header
     tx = div_x + 3.2
-    y_start = 5.8
-    pitch_y = 5.1
+    y_start = 5.6
+    pitch_y = 4.4
     
     lines = [
-        ("LAGRANGE // 3-BODY CONSTELLATION", 1.7, 2.4),
-        (f"ČAS : {state['cet_str']} CET", 1.4, 2.0),
-        (f"DH36: {state['dh36']['str']} (DEKAN {state['dh36']['decan']:02d})", 1.4, 2.0),
-        (f"AZIM: {state['dh36']['azimuth_deg']:.1f}° SOLAR VECTOR", 1.4, 2.0),
-        (f"LUNA: {state['lunar']['lunation_number']}. LUNACE ({state['lunar']['illumination_pct']}%)", 1.4, 2.0),
-        (f"SÍŤ : {state['grid']['freq_hz']:.3f} HZ (Δ {state['grid']['drift_mhz']:+.1f} MHZ)", 1.4, 2.0),
-        (f"METEO: {state['weather']['temp_c']:+.1f}°C | {state['weather']['pressure_hpa']:.1f} HPA | {state['weather']['rh_pct']}% RH", 1.25, 1.8),
-        (f"L2  : ANTI-SOLAR SHADOW (JWST/GAIA)", 1.3, 1.85),
-        (f"L3  : COUNTER-EARTH (3.0E8 KM)", 1.3, 1.85),
-        (f"L4/5: TROJAN TRIAD (+-60° EQUIL)", 1.3, 1.85),
-        (f"L2M : LUNAR FAR-SIDE HALO ANCHOR", 1.3, 1.85),
-        ("--TÉCHNĒ & KOF // DRKOTA V-PLOTTER", 1.2, 1.7),
+        ("LAGRANGE // 3-BODY CONSTELLATION", 1.6, 2.3),
+        (f"ČAS : {state['cet_str']} CET", 1.3, 1.8),
+        (f"DH36: {state['dh36']['str']} (DEKAN {state['dh36']['decan']:02d})", 1.25, 1.7),
+        (f"LUNA: {state['lunar']['lunation_number']}. LUNACE ({state['lunar']['illumination_pct']}%)", 1.25, 1.7),
+        (f"SÍŤ : {state['grid']['freq_hz']:.3f} HZ (Δ {state['grid']['drift_mhz']:+.1f} MHZ)", 1.25, 1.7),
+        (f"METEO: {state['weather']['temp_c']:+.1f}°C | {state['weather']['pressure_hpa']:.0f} HPA | {state['weather']['rh_pct']}% RH", 1.2, 1.65),
+        (f"L2/L3/L4/L5/L2M // --TÉCHNĒ & KOF", 1.15, 1.6),
     ]
     
     for idx, (txt, cw, ch) in enumerate(lines):
@@ -534,7 +529,62 @@ def generate_lagrange_svg(state, width_mm=120.0):
         paths.extend(render_text_strokes(txt, tx, cur_y, char_w=cw, char_h=ch))
     
     # Title underline
-    paths.append(path_line(tx, y_start + 3.8, width_mm - 5.0, y_start + 3.8))
+    paths.append(path_line(tx, y_start + 3.6, width_mm - 5.0, y_start + 3.6))
+    
+    # 50Hz Hourly Grid Drift Seismograph Graph (Y: 37.0 to 68.5 mm)
+    gx = tx
+    gy_top = 37.0
+    gw = (width_mm - 5.0) - gx
+    gh = (h_mm - 5.5) - gy_top
+    gy_mid = gy_top + gh * 0.46
+    
+    # Outer graph box
+    paths.append(path_rect(gx, gy_top, gw, gh))
+    
+    # Header label
+    paths.extend(render_text_strokes("[STOPA: SÍŤ 50 HZ // HODINOVÝ DRIFT]", gx + 2.0, gy_top + 1.4, char_w=0.9, char_h=1.3))
+    
+    # Baseline (50.000 Hz / 0 mHz)
+    paths.append(path_line(gx + 11.5, gy_mid, gx + gw - 2.0, gy_mid))
+    paths.extend(render_text_strokes("50.0", gx + 1.2, gy_mid - 0.8, char_w=0.8, char_h=1.2))
+    
+    # Guidelines: +50 mHz, -50 mHz
+    y_pos50 = gy_mid - (50.0 / 50.0) * (gh * 0.27)
+    y_neg50 = gy_mid - (-50.0 / 50.0) * (gh * 0.27)
+    for y_dash in [y_pos50, y_neg50]:
+        cur_x = gx + 11.5
+        while cur_x < gx + gw - 2.0:
+            paths.append(path_line(cur_x, y_dash, min(cur_x + 2.0, gx + gw - 2.0), y_dash))
+            cur_x += 4.0
+    paths.extend(render_text_strokes("+50", gx + 1.2, y_pos50 - 0.8, char_w=0.75, char_h=1.1))
+    paths.extend(render_text_strokes("-50", gx + 1.2, y_neg50 - 0.8, char_w=0.75, char_h=1.1))
+    
+    # Continuous seismograph waveform (hourly trace)
+    cur_drift = state["grid"]["drift_mhz"]
+    num_pts = 48
+    plot_w = (gx + gw - 2.5) - (gx + 12.0)
+    x_step = plot_w / float(num_pts)
+    trace_pts = []
+    for i in range(num_pts + 1):
+        xp = (gx + 12.0) + i * x_step
+        delta = math.sin(i * 0.42) * 5.5 + math.cos(i * 0.21) * 3.8 + math.sin(i * 0.85) * 2.0
+        d_val = cur_drift + delta
+        clamped = max(-55.0, min(55.0, d_val))
+        yp = gy_mid - (clamped / 50.0) * (gh * 0.27)
+        trace_pts.append((xp, yp))
+    
+    d_trace = f"M {trace_pts[0][0]:.2f},{trace_pts[0][1]:.2f} " + " ".join(f"L {p[0]:.2f},{p[1]:.2f}" for p in trace_pts[1:])
+    paths.append(d_trace)
+    
+    # Time X-Axis at bottom of graph
+    ax_y = gy_top + gh - 4.2
+    paths.append(path_line(gx + 11.5, ax_y, gx + gw - 2.0, ax_y))
+    cur_ts = state.get("timestamp", time.time())
+    for idx_t, (frac, label_t) in enumerate([(0.0, "-60M"), (0.5, "-30M"), (1.0, "[NYNÍ]")]):
+        tx_p = (gx + 12.0) + frac * plot_w
+        paths.append(path_line(tx_p, ax_y, tx_p, ax_y - 1.2))
+        al = "left" if idx_t == 0 else ("center" if idx_t == 1 else "right")
+        paths.extend(render_text_strokes(label_t, tx_p, ax_y + 0.9, char_w=0.75, char_h=1.1, align=al))
     
     d_attr = " ".join(paths)
     svg = (
