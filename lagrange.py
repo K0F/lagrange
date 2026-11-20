@@ -565,6 +565,9 @@ def main():
     p_plot = subparsers.add_parser("plot", help="Dispatch to Drkota V-plotter")
     p_plot.add_argument("--dry-run", action="store_true", help="Simulate without hardware movement")
     p_plot.add_argument("--width", type=float, default=120.0, help="Width in mm")
+    p_plot.add_argument("--scale", type=float, default=0.5, help="Scale factor (default 0.5 = 50%%)")
+    p_plot.add_argument("--speed", type=int, default=150, help="Stepper pulse delay in us (default 150 = 2x speed)")
+    p_plot.add_argument("--feed", type=float, default=1.0, help="Feedrate multiplier (default 1.0)")
     
     args = parser.parse_args()
     
@@ -607,10 +610,11 @@ def main():
         png_path = convert_svg_to_png(out_svg)
         if png_path and os.path.exists(png_path):
             print(f"[+] PNG náhled vygenerován: {png_path} ({os.path.getsize(png_path)} bajtů)")
+        plot_args = f"--scale {args.scale} --speed {args.speed} --feed {args.feed}"
         if args.dry_run:
-            print(f"[DRY-RUN] Simulace plotru Drkota: /home/kof/bin/drkota plot {out_svg}")
+            print(f"[DRY-RUN] Simulace plotru Drkota: /home/kof/bin/drkota plot {out_svg} {plot_args}")
         else:
-            drkota_cmd = f"/home/kof/bin/drkota plot {out_svg}"
+            drkota_cmd = f"/home/kof/bin/drkota plot {out_svg} {plot_args}"
             os.system(drkota_cmd)
 
 if __name__ == "__main__":
